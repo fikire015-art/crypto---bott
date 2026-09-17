@@ -1,317 +1,113 @@
-# main.py
-# CryptoFlowBot
-# Python 3.10+
-
 import os
-import io
-import base64
+import time
 import threading
-import asyncio
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 import pandas as pd
-
-from groq import Groq
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
-    CallbackQueryHandler,
 )
 
-
 # =========================================================
-# ENVIRONMENT VARIABLES
+# CONFIG
 # =========================================================
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+MIN_TARGET_PIPS = 100
+CANDLE_LIMIT = 200
+SCAN_DELAY = 60
 
-# =========================================================
-# SETTINGS
-# =========================================================
-
-TIMEFRAME = "15min"
-CANDLE_LIMIT = 120
-
-GOOD_MARKET = 70
-MIN_PIPS = 100
-
-# Groq vision model
-VISION_MODEL = "qwen/qwen3.6-27b"
-
-# Scan settings
-SCAN_DELAY = 0.12
-SCAN_TOP_RESULTS = 10
-
-# 0 = scan all Binance USDT symbols
-MAX_SCAN_SYMBOLS = 0
-
+TIMEFRAMES = {
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1H": "1h",
+    "4H": "4h",
+}
 
 # =========================================================
 # SYMBOLS
 # =========================================================
 
-FOREX_SYMBOLS = [
+SYMBOLS = [
+    "XAU/USD",
+    "XAG/USD",
+
     "EUR/USD",
     "GBP/USD",
     "USD/JPY",
-    "AUD/USD",
-    "USD/CAD",
     "USD/CHF",
+    "AUD/USD",
     "NZD/USD",
+    "USD/CAD",
 
     "EUR/GBP",
     "EUR/JPY",
+    "EUR/CHF",
     "GBP/JPY",
+    "GBP/CHF",
     "AUD/JPY",
     "CAD/JPY",
     "CHF/JPY",
-    "NZD/JPY",
 
-    "EUR/AUD",
-    "EUR/CAD",
-    "EUR/CHF",
-    "GBP/AUD",
-    "GBP/CAD",
-    "GBP/CHF",
-    "AUD/CAD",
-    "AUD/CHF",
-    "AUD/NZD",
-    "CAD/CHF",
-    "NZD/CAD",
-    "NZD/CHF",
+    "BTC/USDT",
+    "ETH/USDT",
+    "BNB/USDT",
+    "SOL/USDT",
+    "XRP/USDT",
 ]
 
-METAL_SYMBOLS = [
-    "XAU/USD",
-    "XAG/USD",
-]
-
-CRYPTO_SYMBOLS = [
-    "BTCUSDT",
-    "ETHUSDT",
-    "BNBUSDT",
-    "SOLUSDT",
-    "XRPUSDT",
-    "ADAUSDT",
-    "DOGEUSDT",
-    "AVAXUSDT",
-    "DOTUSDT",
-    "LINKUSDT",
-    "LTCUSDT",
-    "BCHUSDT",
-    "TRXUSDT",
-    "ATOMUSDT",
-    "ETCUSDT",
-    "FILUSDT",
-    "NEARUSDT",
-    "APTUSDT",
-    "ARBUSDT",
-    "OPUSDT",
-]
-
-STATIC_SCAN_SYMBOLS = FOREX_SYMBOLS + METAL_SYMBOLS + CRYPTO_SYMBOLS
-
-# Symbols shown as clickable Telegram buttons.
-AVAILABLE_SYMBOLS = STATIC_SCAN_SYMBOLS
-
-
 # =========================================================
-# VALIDATION
-# =========================================================
-
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN is missing."
-    )
-
-if not GROQ_API_KEY:
-    raise RuntimeError(
-        "GROQ_API_KEY is missing."
-    )
-
-
-groq_client = Groq(api_key=GROQ_API_KEY)
-
-
-# =========================================================
-# RENDER HEALTH SERVER
+# HEALTH SERVER FOR RENDER
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
-
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write(
-            b"CryptoFlowBot is running."
-        )
+        self.wfile.write(b"CryptoFlowBot is running")
 
     def log_message(self, format, *args):
         return
 
 
 def start_health_server():
-
-    port = int(os.getenv("PORT", "10000"))
-
-    server = HTTPServer(
-        ("0.0.0.0", port),
-        HealthHandler
-    )
-
-    print(f"Health server running on port {port}")
-
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
 
 # =========================================================
-# TELEGRAM HELPERS
+# DATA
 # =========================================================
 
-async def send_message(
-    context: ContextTypes.DEFAULT_TYPE,
-    text: str
-):
+def get_binance_data(symbol, interval, limit=CANDLE_LIMIT):
+    try:
+        pair = symbol.replace("/", "")
 
-    if CHAT_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=text
-            )
-        except Exception as e:
-            print("Telegram send error:", e)
+        url = "https://api.binance.com/api/v3/klines"
 
+        params = {
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit
+        }
 
-# =========================================================
-# SYMBOL NORMALIZATION
-# =========================================================
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
 
-def normalize_symbol(symbol: str) -> str:
+        if not isinstance(data, list):
+            return None
 
-    symbol = symbol.strip().upper()
-
-    symbol = symbol.replace(
-        " ",
-        ""
-    )
-
-    symbol = symbol.replace(
-        "-",
-        ""
-    )
-
-    symbol = symbol.replace(
-        "_",
-        ""
-    )
-
-    # FX
-    if len(symbol) == 6 and "/" not in symbol:
-        return (
-            symbol[:3]
-            + "/"
-            + symbol[3:]
-        )
-
-    # Gold / silver
-    if symbol in ["XAUUSD", "GOLD"]:
-        return "XAU/USD"
-
-    if symbol in ["XAGUSD", "SILVER"]:
-        return "XAG/USD"
-
-    return symbol
-
-
-def binance_symbol(symbol: str) -> str:
-
-    symbol = symbol.upper().replace(
-        "/",
-        ""
-    )
-
-    return symbol
-
-
-def is_crypto_symbol(symbol: str) -> bool:
-
-    symbol = symbol.upper()
-
-    if "/" in symbol:
-        return False
-
-    quote_assets = [
-        "USDT",
-        "USDC",
-        "FDUSD",
-        "BTC",
-        "ETH",
-        "BNB",
-    ]
-
-    return any(
-        symbol.endswith(q)
-        for q in quote_assets
-    )
-
-
-# =========================================================
-# BINANCE
-# =========================================================
-
-def get_binance_data(
-    symbol: str,
-    limit: int = CANDLE_LIMIT
-):
-
-    symbol = binance_symbol(symbol)
-
-    url = (
-        "https://api.binance.com"
-        "/api/v3/klines"
-    )
-
-    params = {
-        "symbol": symbol,
-        "interval": "15m",
-        "limit": limit,
-    }
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=15
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if not isinstance(data, list):
-        raise RuntimeError(
-            f"Binance error: {data}"
-        )
-
-    if len(data) < 50:
-        raise RuntimeError(
-            "Not enough Binance candles."
-        )
-
-    df = pd.DataFrame(
-        data,
-        columns=[
+        df = pd.DataFrame(data, columns=[
             "time",
             "open",
             "high",
@@ -319,231 +115,175 @@ def get_binance_data(
             "close",
             "volume",
             "close_time",
-            "qav",
+            "quote_volume",
             "trades",
-            "tbav",
-            "tqav",
-            "ignore",
-        ]
-    )
+            "buy_volume",
+            "buy_quote_volume",
+            "ignore"
+        ])
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    ]:
-        df[column] = df[column].astype(float)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col])
 
-    return df
+        return df
+
+    except Exception as e:
+        print("Binance error:", symbol, e)
+        return None
 
 
-# =========================================================
-# TWELVE DATA
-# =========================================================
+def get_twelve_data(symbol, interval, limit=CANDLE_LIMIT):
+    try:
+        url = "https://api.twelvedata.com/time_series"
 
-def get_twelve_data(
-    symbol: str,
-    limit: int = CANDLE_LIMIT
-):
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": limit,
+            "apikey": TWELVE_DATA_KEY,
+            "format": "JSON"
+        }
 
-    if not TWELVE_DATA_KEY:
-        raise RuntimeError(
-            "TWELVE_DATA_KEY is missing."
-        )
+        r = requests.get(url, params=params, timeout=20)
+        data = r.json()
 
-    url = (
-        "https://api.twelvedata.com"
-        "/time_series"
-    )
+        if "values" not in data:
+            print("Twelve Data error:", symbol, data)
+            return None
 
-    params = {
-        "symbol": symbol,
-        "interval": TIMEFRAME,
-        "outputsize": limit,
-        "apikey": TWELVE_DATA_KEY,
-    }
+        df = pd.DataFrame(data["values"])
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=20
-    )
+        df["datetime"] = pd.to_datetime(df["datetime"])
 
-    response.raise_for_status()
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    data = response.json()
+        df = df.sort_values("datetime").reset_index(drop=True)
 
-    if "values" not in data:
-        raise RuntimeError(
-            str(data)
-        )
+        return df
 
-    df = pd.DataFrame(
-        data["values"]
-    )
+    except Exception as e:
+        print("Twelve Data error:", symbol, e)
+        return None
 
-    df = df.iloc[::-1].reset_index(
-        drop=True
-    )
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-    ]:
-        df[column] = df[column].astype(float)
+def get_data(symbol, timeframe):
+    interval = TIMEFRAMES[timeframe]
 
-    return df
+    if symbol.endswith("/USDT"):
+        return get_binance_data(symbol, interval)
+
+    return get_twelve_data(symbol, interval)
 
 
 # =========================================================
-# GET MARKET DATA
+# LIVE PRICE
 # =========================================================
 
-def get_market_data(symbol: str):
+def get_live_price(symbol):
+    try:
+        if symbol.endswith("/USDT"):
+            pair = symbol.replace("/", "")
 
-    symbol = normalize_symbol(symbol)
+            url = "https://api.binance.com/api/v3/ticker/price"
 
-    # Crypto → Binance first
-    if is_crypto_symbol(symbol):
-
-        try:
-            return get_binance_data(
-                symbol
-            )
-        except Exception as binance_error:
-
-            print(
-                f"Binance failed for "
-                f"{symbol}: {binance_error}"
+            r = requests.get(
+                url,
+                params={"symbol": pair},
+                timeout=10
             )
 
-            # Try Twelve Data fallback
-            if symbol.endswith("USDT"):
+            data = r.json()
+            return float(data["price"])
 
-                base = symbol[:-4]
+        url = "https://api.twelvedata.com/price"
 
-                twelve_symbol = (
-                    f"{base}/USD"
-                )
+        params = {
+            "symbol": symbol,
+            "apikey": TWELVE_DATA_KEY
+        }
 
-                return get_twelve_data(
-                    twelve_symbol
-                )
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
 
-            raise
+        if "price" in data:
+            return float(data["price"])
 
-    # Forex / Metals → Twelve Data
-    return get_twelve_data(
-        symbol
-    )
+    except Exception as e:
+        print("Live price error:", symbol, e)
+
+    return None
 
 
 # =========================================================
 # INDICATORS
 # =========================================================
 
-def calculate_indicators(df):
+def add_indicators(df):
 
     df = df.copy()
 
-    # EMA
-    df["EMA20"] = (
-        df["close"]
-        .ewm(
-            span=20,
-            adjust=False
-        )
-        .mean()
-    )
+    df["EMA20"] = df["close"].ewm(
+        span=20,
+        adjust=False
+    ).mean()
 
-    df["EMA50"] = (
-        df["close"]
-        .ewm(
-            span=50,
-            adjust=False
-        )
-        .mean()
-    )
+    df["EMA50"] = df["close"].ewm(
+        span=50,
+        adjust=False
+    ).mean()
 
-    # RSI
+    df["EMA200"] = df["close"].ewm(
+        span=200,
+        adjust=False
+    ).mean()
+
     delta = df["close"].diff()
 
-    gain = delta.clip(
-        lower=0
-    )
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    loss = -delta.clip(
-        upper=0
-    )
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
 
-    avg_gain = gain.rolling(
-        14
-    ).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
 
-    avg_loss = loss.rolling(
-        14
-    ).mean()
+    df["RSI"] = 100 - (100 / (1 + rs))
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        pd.NA
-    )
-
-    df["RSI"] = (
-        100
-        - (
-            100
-            / (1 + rs)
-        )
-    )
-
-    # ATR
-    high_low = (
-        df["high"]
-        - df["low"]
-    )
+    high_low = df["high"] - df["low"]
 
     high_close = (
-        df["high"]
-        - df["close"].shift()
+        df["high"] - df["close"].shift()
     ).abs()
 
     low_close = (
-        df["low"]
-        - df["close"].shift()
+        df["low"] - df["close"].shift()
     ).abs()
 
-    true_range = pd.concat(
-        [
-            high_low,
-            high_close,
-            low_close,
-        ],
+    tr = pd.concat(
+        [high_low, high_close, low_close],
         axis=1
     ).max(axis=1)
 
-    df["ATR"] = (
-        true_range
-        .rolling(14)
-        .mean()
-    )
+    df["ATR"] = tr.rolling(14).mean()
 
-    # Recent high / low
-    df["RECENT_HIGH"] = (
-        df["high"]
-        .rolling(20)
-        .max()
-    )
+    ema12 = df["close"].ewm(
+        span=12,
+        adjust=False
+    ).mean()
 
-    df["RECENT_LOW"] = (
-        df["low"]
-        .rolling(20)
-        .min()
-    )
+    ema26 = df["close"].ewm(
+        span=26,
+        adjust=False
+    ).mean()
+
+    df["MACD"] = ema12 - ema26
+
+    df["MACD_SIGNAL"] = df["MACD"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
     return df
 
@@ -552,11 +292,7 @@ def calculate_indicators(df):
 # PIP SIZE
 # =========================================================
 
-def pip_size(symbol: str):
-
-    symbol = normalize_symbol(
-        symbol
-    )
+def pip_size(symbol):
 
     if symbol.startswith("XAU"):
         return 0.01
@@ -567,822 +303,605 @@ def pip_size(symbol: str):
     if "JPY" in symbol:
         return 0.01
 
-    if (
-        "/" in symbol
-        and len(symbol) == 7
-    ):
-        return 0.0001
+    if symbol.endswith("/USDT"):
+        return None
 
-    # Crypto has no universal broker-defined pip.
-    return None
+    return 0.0001
 
 
 # =========================================================
-# PRICE FORMAT
+# FORMAT PRICE
 # =========================================================
 
-def format_price(price):
+def price_digits(symbol):
 
-    if price >= 1000:
-        return f"{price:.2f}"
+    if symbol.startswith("XAU"):
+        return 2
 
-    if price >= 100:
-        return f"{price:.3f}"
+    if symbol.startswith("XAG"):
+        return 2
 
-    if price >= 1:
-        return f"{price:.5f}"
+    if "JPY" in symbol:
+        return 3
 
-    return f"{price:.8f}"
+    if symbol.endswith("/USDT"):
+        return 2
+
+    return 5
+
+
+def fmt(symbol, value):
+
+    if value is None:
+        return "N/A"
+
+    return f"{value:.{price_digits(symbol)}f}"
 
 
 # =========================================================
-# MARKET ANALYSIS
+# ANALYSIS
 # =========================================================
 
-def analyze_market(
-    df,
-    symbol
-):
+def analyze_market(symbol, timeframe):
 
-    df = calculate_indicators(
-        df
-    )
+    df = get_data(symbol, timeframe)
 
-    row = df.iloc[-1]
-    previous = df.iloc[-2]
+    if df is None or len(df) < 80:
+        return None
 
-    price = float(
-        row["close"]
-    )
+    df = add_indicators(df)
 
-    ema20 = float(
-        row["EMA20"]
-    )
+    # -----------------------------------------------------
+    # IMPORTANT:
+    # -1 = current/in-progress candle
+    # -2 = last CLOSED candle
+    # -3 = previous CLOSED candle
+    # -----------------------------------------------------
 
-    ema50 = float(
-        row["EMA50"]
-    )
+    last = df.iloc[-2]
+    prev = df.iloc[-3]
 
-    rsi = float(
-        row["RSI"]
-    )
+    live_price = get_live_price(symbol)
 
-    atr = float(
-        row["ATR"]
-    )
+    if live_price is None:
+        live_price = float(df.iloc[-1]["close"])
 
-    recent_high = float(
-        row["RECENT_HIGH"]
-    )
+    close = float(last["close"])
 
-    recent_low = float(
-        row["RECENT_LOW"]
-    )
+    ema20 = float(last["EMA20"])
+    ema50 = float(last["EMA50"])
+    ema200 = float(last["EMA200"])
+
+    rsi = float(last["RSI"])
+    atr = float(last["ATR"])
+
+    macd = float(last["MACD"])
+    macd_signal = float(last["MACD_SIGNAL"])
+
+    prev_close = float(prev["close"])
 
     buy_score = 0
     sell_score = 0
-
-    reasons_buy = []
-    reasons_sell = []
 
     # -----------------------------------------------------
     # TREND
     # -----------------------------------------------------
 
     if ema20 > ema50:
+        buy_score += 20
+    else:
+        sell_score += 20
 
-        buy_score += 25
-
-        reasons_buy.append(
-            "EMA20 above EMA50"
-        )
-
-    elif ema20 < ema50:
-
-        sell_score += 25
-
-        reasons_sell.append(
-            "EMA20 below EMA50"
-        )
+    if ema50 > ema200:
+        buy_score += 15
+    else:
+        sell_score += 15
 
     # -----------------------------------------------------
     # PRICE POSITION
     # -----------------------------------------------------
 
-    if price > ema20:
-
-        buy_score += 20
-
-        reasons_buy.append(
-            "Price above EMA20"
-        )
-
-    elif price < ema20:
-
-        sell_score += 20
-
-        reasons_sell.append(
-            "Price below EMA20"
-        )
+    if close > ema20:
+        buy_score += 10
+    else:
+        sell_score += 10
 
     # -----------------------------------------------------
     # RSI
     # -----------------------------------------------------
 
-    if 52 <= rsi <= 70:
+    if 50 <= rsi <= 68:
+        buy_score += 15
 
-        buy_score += 20
+    elif 32 <= rsi < 50:
+        sell_score += 15
 
-        reasons_buy.append(
-            f"RSI bullish ({rsi:.1f})"
-        )
+    elif rsi > 70:
+        sell_score += 5
 
-    elif 30 <= rsi <= 48:
+    elif rsi < 30:
+        buy_score += 5
 
-        sell_score += 20
+    # -----------------------------------------------------
+    # MACD
+    # -----------------------------------------------------
 
-        reasons_sell.append(
-            f"RSI bearish ({rsi:.1f})"
-        )
+    if macd > macd_signal:
+        buy_score += 15
+    else:
+        sell_score += 15
 
     # -----------------------------------------------------
     # MOMENTUM
     # -----------------------------------------------------
 
-    if price > float(
-        previous["close"]
-    ):
-
-        buy_score += 15
-
-        reasons_buy.append(
-            "Positive momentum"
-        )
-
-    elif price < float(
-        previous["close"]
-    ):
-
-        sell_score += 15
-
-        reasons_sell.append(
-            "Negative momentum"
-        )
+    if close > prev_close:
+        buy_score += 10
+    else:
+        sell_score += 10
 
     # -----------------------------------------------------
-    # STRUCTURE
+    # CANDLE DIRECTION
     # -----------------------------------------------------
 
-    if price > recent_low:
-
+    if last["close"] > last["open"]:
         buy_score += 5
-
-    if price < recent_high:
-
+    else:
         sell_score += 5
 
     # -----------------------------------------------------
-    # ATR QUALITY
+    # DIRECTION
     # -----------------------------------------------------
-
-    if atr > 0:
-
-        buy_score += 5
-        sell_score += 5
-
-    # -----------------------------------------------------
-    # FINAL SCORE
-    # -----------------------------------------------------
-
-    confidence = int(
-        max(
-            buy_score,
-            sell_score
-        )
-    )
 
     if buy_score > sell_score:
-
         direction = "BUY"
-
-        reasons = reasons_buy
-
-    elif sell_score > buy_score:
-
-        direction = "SELL"
-
-        reasons = reasons_sell
-
+        score = buy_score
     else:
-
-        direction = "NONE"
-
-        reasons = []
+        direction = "SELL"
+        score = sell_score
 
     # -----------------------------------------------------
-    # MARKET QUALITY
+    # CONFIDENCE
     # -----------------------------------------------------
 
-    if confidence >= GOOD_MARKET:
+    confidence = min(int(score), 100)
 
-        market = "GOOD"
+    if confidence >= 75:
+        status = "STRONG"
+
+    elif confidence >= 65:
+        status = "GOOD"
 
     elif confidence >= 55:
-
-        market = "UNCERTAIN"
+        status = "UNCERTAIN"
 
     else:
-
-        market = "NO TRADE"
-
-    # -----------------------------------------------------
-    # NO TRADE
-    # -----------------------------------------------------
-
-    if market == "NO TRADE":
-
-        return {
-            "symbol": symbol,
-            "market": market,
-            "confidence": confidence,
-            "direction": "NO TRADE",
-            "price": price,
-            "atr": atr,
-            "reasons": reasons,
-        }
+        status = "NO TRADE"
 
     # -----------------------------------------------------
-    # UNCERTAIN
-    # -----------------------------------------------------
-
-    if market == "UNCERTAIN":
-
-        return {
-            "symbol": symbol,
-            "market": market,
-            "confidence": confidence,
-            "direction": direction,
-            "price": price,
-            "atr": atr,
-            "reasons": reasons,
-        }
-
-    # =====================================================
-    # GOOD TRADE
-    # =====================================================
-
-    # -----------------------------------------------------
-    # LIMIT ENTRY
+    # ENTRY / SL
     # -----------------------------------------------------
 
     if direction == "BUY":
 
-        # Pullback Buy Limit
-        limit_entry = (
-            price - atr * 0.35
-        )
+        live_entry = live_price
 
-        # Do not put limit below
-        # an unreasonable structure area
-        if limit_entry < recent_low:
+        sl = live_entry - (atr * 1.5)
 
-            limit_entry = (
-                price - atr * 0.20
-            )
+        future_entry = live_entry - (atr * 0.35)
 
-        sl = (
-            limit_entry
-            - atr * 1.40
-        )
+        future_sl = future_entry - (atr * 1.5)
 
     else:
 
-        # Pullback Sell Limit
-        limit_entry = (
-            price + atr * 0.35
-        )
+        live_entry = live_price
 
-        if limit_entry > recent_high:
+        sl = live_entry + (atr * 1.5)
 
-            limit_entry = (
-                price + atr * 0.20
-            )
+        future_entry = live_entry + (atr * 0.35)
 
-        sl = (
-            limit_entry
-            + atr * 1.40
-        )
+        future_sl = future_entry + (atr * 1.5)
 
     # -----------------------------------------------------
-    # TARGET SIZE
+    # TARGET
     # -----------------------------------------------------
 
-    # Stronger confidence → larger targets
-    if confidence >= 90:
-
-        target_factor = 4.0
-
-    elif confidence >= 85:
-
-        target_factor = 3.0
-
-    elif confidence >= 75:
-
-        target_factor = 2.4
-
-    else:
-
-        target_factor = 1.8
-
-    # -----------------------------------------------------
-    # FX / GOLD MINIMUM 100 PIPS
-    # -----------------------------------------------------
+    # Minimum target = more than 100 pips
+    target_distance = atr * 3.0
 
     pip = pip_size(symbol)
 
     if pip is not None:
 
-        minimum_move = (
-            MIN_PIPS * pip
-        )
+        minimum_distance = pip * (MIN_TARGET_PIPS + 1)
 
-    else:
-
-        # Crypto:
-        # use ATR, not "pips"
-        minimum_move = (
-            atr * 2.0
+        target_distance = max(
+            target_distance,
+            minimum_distance
         )
 
     # -----------------------------------------------------
-    # TARGETS
-    # -----------------------------------------------------
-
-    tp1_move = max(
-        atr * target_factor,
-        minimum_move
-    )
-
-    tp2_move = max(
-        tp1_move * 1.75,
-        atr * (
-            target_factor + 1.5
-        )
-    )
-
-    tp3_move = max(
-        tp2_move * 1.50,
-        atr * (
-            target_factor + 3.0
-        )
-    )
-
-    if direction == "BUY":
-
-        tp1 = (
-            limit_entry
-            + tp1_move
-        )
-
-        tp2 = (
-            limit_entry
-            + tp2_move
-        )
-
-        tp3 = (
-            limit_entry
-            + tp3_move
-        )
-
-    else:
-
-        tp1 = (
-            limit_entry
-            - tp1_move
-        )
-
-        tp2 = (
-            limit_entry
-            - tp2_move
-        )
-
-        tp3 = (
-            limit_entry
-            - tp3_move
-        )
-
-    # -----------------------------------------------------
-    # RISK / REWARD + PIPS
+    # LIVE TP
     # -----------------------------------------------------
 
     if direction == "BUY":
 
-        risk = abs(
-            limit_entry - sl
-        )
+        live_tp = live_entry + target_distance
 
-        reward = abs(
-            tp2 - limit_entry
+        future_target = future_entry + target_distance
+
+    else:
+
+        live_tp = live_entry - target_distance
+
+        future_target = future_entry - target_distance
+
+    # -----------------------------------------------------
+    # PIPS
+    # -----------------------------------------------------
+
+    if pip is not None:
+
+        target_pips = int(
+            target_distance / pip
         )
 
     else:
 
-        risk = abs(
-            sl - limit_entry
-        )
+        target_pips = None
 
-        reward = abs(
-            limit_entry - tp2
-        )
+    # -----------------------------------------------------
+    # FUTURE SETUP
+    # -----------------------------------------------------
 
-    rr = (
-        reward / risk
-        if risk > 0
-        else 0
-    )
+    future_type = "PULLBACK"
 
-    # Calculate pip distances for FX / Gold / Silver.
-    # Crypto does not have a universal broker pip size,
-    # so these values are left as None for crypto.
-    pip = pip_size(symbol)
+    # If price is breaking recent structure,
+    # use breakout as the future scenario.
 
-    if pip is not None and pip > 0:
-        risk_pips = round(risk / pip)
-        tp1_pips = round(abs(tp1 - limit_entry) / pip)
-        tp2_pips = round(abs(tp2 - limit_entry) / pip)
-        tp3_pips = round(abs(tp3 - limit_entry) / pip)
-    else:
-        risk_pips = None
-        tp1_pips = None
-        tp2_pips = None
-        tp3_pips = None
+    recent_high = df["high"].iloc[-22:-2].max()
+    recent_low = df["low"].iloc[-22:-2].min()
+
+    if direction == "BUY" and close > recent_high:
+        future_type = "BREAKOUT"
+
+    elif direction == "SELL" and close < recent_low:
+        future_type = "BREAKOUT"
+
+    # -----------------------------------------------------
+    # RESULT
+    # -----------------------------------------------------
 
     return {
         "symbol": symbol,
-        "market": market,
-        "confidence": confidence,
+        "timeframe": timeframe,
+
         "direction": direction,
-        "price": price,
+        "status": status,
+        "confidence": confidence,
+
+        "live_price": live_price,
+
+        "live_entry": live_entry,
+        "live_sl": sl,
+        "live_tp": live_tp,
+
+        "future_type": future_type,
+        "future_entry": future_entry,
+        "future_sl": future_sl,
+        "future_target": future_target,
+
+        "target_distance": target_distance,
+        "target_pips": target_pips,
+
+        "rsi": rsi,
         "atr": atr,
-        "limit_entry": limit_entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "rr": rr,
-        "risk_pips": risk_pips,
-        "tp1_pips": tp1_pips,
-        "tp2_pips": tp2_pips,
-        "tp3_pips": tp3_pips,
-        "reasons": reasons,
     }
 
 
 # =========================================================
-# FORMAT ANALYSIS
+# TELEGRAM MESSAGE
 # =========================================================
 
-def format_analysis(result):
+def signal_message(result):
+
+    if result is None:
+        return "❌ Analysis data unavailable."
 
     symbol = result["symbol"]
-
-    market = result["market"]
-
-    confidence = result["confidence"]
+    tf = result["timeframe"]
 
     direction = result["direction"]
+    status = result["status"]
+    confidence = result["confidence"]
 
-    price = result["price"]
+    target_pips = result["target_pips"]
 
-    if market != "GOOD":
-
-        return (
-            f"📊 {symbol}\n\n"
-            f"Market: {market}\n"
-            f"Confidence: {confidence}%\n"
-            f"Current Price: "
-            f"{format_price(price)}\n\n"
-            f"⚠️ No strong trade setup yet."
-        )
-
-    limit_entry = result[
-        "limit_entry"
-    ]
-
-    sl = result["sl"]
-    tp1 = result["tp1"]
-    tp2 = result["tp2"]
-    tp3 = result["tp3"]
-    rr = result["rr"]
-
-    risk_pips = result.get("risk_pips")
-    tp1_pips = result.get("tp1_pips")
-    tp2_pips = result.get("tp2_pips")
-    tp3_pips = result.get("tp3_pips")
-
-    if risk_pips is not None:
-        pip_text = (
-            f"Risk: {risk_pips} pips\n"
-            f"🎯 TP1: {tp1_pips} pips\n"
-            f"🎯 TP2: {tp2_pips} pips\n"
-            f"🎯 TP3: {tp3_pips} pips"
+    if target_pips is None:
+        target_text = (
+            f"{result['target_distance']:.2f} price distance"
         )
     else:
-        pip_text = "Pips: N/A (crypto has no universal pip size)"
+        target_text = f"{target_pips} pips"
 
-    if direction == "BUY":
+    text = (
+        f"📊 {symbol} — {tf}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🚨 LIVE {direction}\n"
+        f"Entry: {fmt(symbol, result['live_entry'])}\n"
+        f"SL: {fmt(symbol, result['live_sl'])}\n"
+        f"TP: {fmt(symbol, result['live_tp'])}\n\n"
 
-        action = "🟢 BUY LIMIT"
+        f"🔮 FUTURE TARGET\n"
+        f"Type: {result['future_type']}\n"
+        f"Future Entry: {fmt(symbol, result['future_entry'])}\n"
+        f"Future SL: {fmt(symbol, result['future_sl'])}\n"
+        f"Future Target: {fmt(symbol, result['future_target'])}\n"
+        f"Target: {target_text}\n\n"
 
-    else:
-
-        action = "🔴 SELL LIMIT"
-
-    reason_text = "\n".join(
-        "• " + x
-        for x in result["reasons"]
+        f"🎯 Confidence: {confidence}%\n"
+        f"📌 Status: {status}\n"
+        f"📈 RSI: {result['rsi']:.1f}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"⚠️ Signal is analysis, not a guaranteed prediction."
     )
 
-    return (
-        f"📊 {symbol}\n\n"
-        f"Market: 🟢 GOOD\n"
-        f"Confidence: {confidence}%\n"
-        f"Signal: {action}\n\n"
-        f"Current Price: {format_price(price)}\n\n"
-        f"Limit Entry: {format_price(limit_entry)}\n"
-        f"SL: {format_price(sl)}\n"
-        f"{pip_text}\n\n"
-        f"🎯 TP1: {format_price(tp1)}\n"
-        f"🎯 TP2: {format_price(tp2)}\n"
-        f"🎯 TP3: {format_price(tp3)}\n\n"
-        f"Risk/Reward: 1:{rr:.2f}\n\n"
-        f"Reasons:\n{reason_text}"
-    )
+    return text
 
 
 # =========================================================
-# TELEGRAM COMMANDS / BOT
+# /START
 # =========================================================
 
-def symbol_keyboard():
-    buttons = []
-    for i in range(0, len(AVAILABLE_SYMBOLS), 2):
-        row = []
-        for symbol in AVAILABLE_SYMBOLS[i:i + 2]:
-            row.append(InlineKeyboardButton(
-                symbol,
-                callback_data=f"symbol:{symbol}"
-            ))
-        buttons.append(row)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    buttons.append([
-        InlineKeyboardButton(
-            "🔎 ALL SYMBOLS",
-            callback_data="scan_all"
-        )
-    ])
-    return InlineKeyboardMarkup(buttons)
-
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    await update.message.reply_text(
-        "🤖 CryptoFlowBot is running.\n\n"
-        "👇 Choose a symbol below, or press ALL SYMBOLS to scan the full configured list.\n\n"
-        "You can still type a symbol manually, for example BTCUSDT or EUR/USD.",
-        reply_markup=symbol_keyboard()
+    message = (
+        "🤖 CryptoFlowBot\n\n"
+        "Welcome.\n\n"
+        "Commands:\n"
+        "/analyze XAU/USD\n"
+        "/scan\n"
+        "/all\n\n"
+        "Example:\n"
+        "/analyze XAU/USD"
     )
 
-
-async def send_analysis(
-    message,
-    symbol: str
-):
-    symbol = symbol.strip()
-    if not symbol:
-        await message.reply_text(
-            "Please choose or send a symbol.",
-            reply_markup=symbol_keyboard()
-        )
-        return
-
-    try:
-        normalized = normalize_symbol(symbol)
-        df = await asyncio.to_thread(get_market_data, normalized)
-        result = await asyncio.to_thread(
-            analyze_market, df, normalized
-        )
-        text = format_analysis(result)
-        await message.reply_text(
-            text,
-            reply_markup=symbol_keyboard()
-        )
-    except Exception as e:
-        print(f"Analysis error for {symbol}: {e}")
-        await message.reply_text(
-            f"❌ Could not analyze {symbol}.\n"
-            f"Error: {e}",
-            reply_markup=symbol_keyboard()
-        )
+    await update.message.reply_text(message)
 
 
-async def analyze_symbol(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    symbol: str
-):
-    await send_analysis(update.message, symbol)
-
+# =========================================================
+# /ANALYZE
+# =========================================================
 
 async def analyze_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     if not context.args:
+
         await update.message.reply_text(
-            "👇 Choose a symbol below or use: /analyze BTCUSDT",
-            reply_markup=symbol_keyboard()
+            "Example:\n/analyze XAU/USD"
         )
+
         return
 
-    symbol = " ".join(context.args)
-    await analyze_symbol(update, context, symbol)
+    symbol = context.args[0].upper()
 
+    if symbol not in SYMBOLS:
 
-async def scan_all_symbols():
-    results = []
-    symbols = AVAILABLE_SYMBOLS[:]
+        await update.message.reply_text(
+            "❌ Symbol not supported."
+        )
 
-    if MAX_SCAN_SYMBOLS > 0:
-        symbols = symbols[:MAX_SCAN_SYMBOLS]
+        return
 
-    for symbol in symbols:
-        try:
-            normalized = normalize_symbol(symbol)
-            df = await asyncio.to_thread(
-                get_market_data, normalized
-            )
-            result = await asyncio.to_thread(
-                analyze_market, df, normalized
-            )
-            results.append(result)
-        except Exception as e:
-            print(f"Scan error for {symbol}: {e}")
-
-        if SCAN_DELAY > 0:
-            await asyncio.sleep(SCAN_DELAY)
-
-    results.sort(
-        key=lambda x: x.get("confidence", 0),
-        reverse=True
+    await update.message.reply_text(
+        f"🔎 Analyzing {symbol}..."
     )
-    return results
 
+    messages = []
 
-def format_scan_results(results):
-    if not results:
-        return (
-            "🔎 ALL SYMBOLS SCAN\n\n"
-            "❌ No symbols could be analyzed right now."
+    for tf in TIMEFRAMES:
+
+        result = analyze_market(
+            symbol,
+            tf
         )
 
-    good = [r for r in results if r.get("market") == "GOOD"]
-    selected = good[:SCAN_TOP_RESULTS] if good else results[:SCAN_TOP_RESULTS]
+        if result:
 
-    lines = [
-        "🔎 ALL SYMBOLS SCAN",
-        "",
-        f"Analyzed: {len(results)} symbols",
-        f"Good setups: {len(good)}",
-        "",
-    ]
+            messages.append(
+                signal_message(result)
+            )
 
-    if good:
-        lines.append("🟢 BEST SETUPS")
-    else:
-        lines.append("⚠️ NO GOOD SETUP — TOP RESULTS")
+    if not messages:
 
-    for i, r in enumerate(selected, 1):
-        direction = r.get("direction", "-")
-        market = r.get("market", "-")
-        confidence = r.get("confidence", 0)
-        symbol = r.get("symbol", "-")
-        icon = "🟢" if direction == "BUY" else "🔴" if direction == "SELL" else "⚪"
-        lines.append(
-            f"{i}. {icon} {symbol} | {direction} | "
-            f"{confidence}% | {market}"
+        await update.message.reply_text(
+            "❌ No analysis data available."
         )
 
-    lines.extend([
-        "",
-        "Tap a symbol below for the full entry / SL / TP setup."
-    ])
-    return "\n".join(lines)
+        return
+
+    for msg in messages:
+
+        await update.message.reply_text(
+            msg
+        )
 
 
-async def button_handler(
+# =========================================================
+# /SCAN
+# =========================================================
+
+async def scan_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-    query = update.callback_query
-    if not query:
-        return
 
-    await query.answer()
+    await update.message.reply_text(
+        "🔎 Scanning all symbols and timeframes..."
+    )
 
-    if query.data == "scan_all":
-        await query.edit_message_text(
-            "⏳ Scanning all configured symbols...\n"
-            "Please wait a moment."
-        )
+    count = 0
+
+    for symbol in SYMBOLS:
+
+        for tf in TIMEFRAMES:
+
+            result = analyze_market(
+                symbol,
+                tf
+            )
+
+            if result is None:
+                continue
+
+            # Send only usable setups
+            if result["confidence"] >= 65:
+
+                await update.message.reply_text(
+                    signal_message(result)
+                )
+
+                count += 1
+
+            time.sleep(0.2)
+
+    await update.message.reply_text(
+        f"✅ Scan complete.\n"
+        f"Signals found: {count}"
+    )
+
+
+# =========================================================
+# BACKGROUND SCANNER
+# =========================================================
+
+def background_scanner(application):
+
+    while True:
+
         try:
-            results = await scan_all_symbols()
-            text = format_scan_results(results)
-            await query.message.reply_text(
-                text,
-                reply_markup=symbol_keyboard()
-            )
+
+            if TELEGRAM_CHAT_ID:
+
+                for symbol in SYMBOLS:
+
+                    # Main scanning timeframe
+                    result = analyze_market(
+                        symbol,
+                        "15m"
+                    )
+
+                    if result is None:
+                        continue
+
+                    if result["confidence"] >= 75:
+
+                        text = signal_message(result)
+
+                        try:
+
+                            asyncio.run(
+                                application.bot.send_message(
+                                    chat_id=TELEGRAM_CHAT_ID,
+                                    text=text
+                                )
+                            )
+
+                        except Exception as e:
+
+                            print(
+                                "Telegram send error:",
+                                e
+                            )
+
+                    time.sleep(1)
+
         except Exception as e:
-            print(f"All-symbol scan error: {e}")
-            await query.message.reply_text(
-                f"❌ ALL SYMBOLS scan failed.\nError: {e}",
-                reply_markup=symbol_keyboard()
-            )
-        return
 
-    if query.data.startswith("symbol:"):
-        symbol = query.data.split(":", 1)[1]
-        await query.edit_message_text(
-            f"⏳ Analyzing {symbol}..."
-        )
-        try:
-            normalized = normalize_symbol(symbol)
-            df = await asyncio.to_thread(get_market_data, normalized)
-            result = await asyncio.to_thread(
-                analyze_market, df, normalized
-            )
-            text = format_analysis(result)
-            await query.message.reply_text(
-                text,
-                reply_markup=symbol_keyboard()
-            )
-        except Exception as e:
-            print(f"Button analysis error for {symbol}: {e}")
-            await query.message.reply_text(
-                f"❌ Could not analyze {symbol}.\nError: {e}",
-                reply_markup=symbol_keyboard()
+            print(
+                "Background scanner error:",
+                e
             )
 
+        time.sleep(SCAN_DELAY)
 
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not update.message or not update.message.text:
-        return
 
-    symbol = update.message.text.strip()
-
-    if symbol.startswith("/"):
-        return
-
-    await analyze_symbol(update, context, symbol)
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
 
-    # Render needs an HTTP listener on the PORT it provides.
-    health_thread = threading.Thread(
+    if not TELEGRAM_BOT_TOKEN:
+
+        raise ValueError(
+            "TELEGRAM_BOT_TOKEN is missing"
+        )
+
+    if not TWELVE_DATA_KEY:
+
+        print(
+            "WARNING: TWELVE_DATA_KEY is missing. "
+            "Forex/Gold data will not work."
+        )
+
+    # Render health server
+    threading.Thread(
         target=start_health_server,
         daemon=True
-    )
-    health_thread.start()
+    ).start()
 
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Telegram
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
 
     application.add_handler(
-        CommandHandler("start", start_command)
-    )
-    application.add_handler(
-        CommandHandler("analyze", analyze_command)
-    )
-    application.add_handler(
-        CallbackQueryHandler(button_handler)
-    )
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            text_handler
+        CommandHandler(
+            "start",
+            start
         )
     )
 
-    print("CryptoFlowBot Telegram polling started.")
+    application.add_handler(
+        CommandHandler(
+            "analyze",
+            analyze_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "scan",
+            scan_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "all",
+            scan_command
+        )
+    )
+
+    # Background scanner
+    threading.Thread(
+        target=background_scanner,
+        args=(application,),
+        daemon=True
+    ).start()
+
+    print(
+        "🚀 CryptoFlowBot started"
+    )
+
     application.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
