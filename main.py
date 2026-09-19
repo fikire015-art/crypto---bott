@@ -1,15 +1,14 @@
 import os
+import re
 import io
-import math
 import base64
-import threading
 import logging
-from datetime import datetime
+import threading
+from typing import Optional
 
 import requests
 import pandas as pd
-from flask import Flask, jsonify
-
+from flask import Flask
 from groq import Groq
 
 from telegram import Update
@@ -22,235 +21,249 @@ from telegram.ext import (
 )
 
 
-# =========================================================
+# ============================================================
 # CONFIG
-# =========================================================
+# ============================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "")
+
+# Current Groq vision model
+GROQ_VISION_MODEL = "qwen/qwen3.6-27b"
+
+# Keep this small to avoid output-token rate-limit problems.
+MAX_COMPLETION_TOKENS = 700
+
+TIMEFRAME = "15min"
+
+# Minimum requested target
+MIN_TARGET_PIPS = 50
+
+# Minimum confidence for BUY/SELL
+MIN_CONFIDENCE = 75
 
 PORT = int(os.getenv("PORT", "10000"))
 
-DEFAULT_TIMEFRAME = "15min"
 
-MIN_CONFIDENCE = 70
-MIN_TARGET_PIPS = 50
-
-CACHE_SECONDS = 45
-DATA_CACHE = {}
-
-# Groq Vision models
-# The bot will automatically look for an available vision model.
-VISION_MODELS = [
-    "qwen/qwen3.6-27b",
-    "qwen/qwen3.8-27b",
-]
-
-GROQ_MAX_TOKENS = 800
-
-
-# =========================================================
+# ============================================================
 # LOGGING
-# =========================================================
+# ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# =========================================================
-# FLASK / RENDER
-# =========================================================
+# ============================================================
+# GROQ CLIENT
+# ============================================================
 
-app = Flask(__name__)
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
-@app.route("/")
+# ============================================================
+# FLASK HEALTH SERVER FOR RENDER
+# ============================================================
+
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
 def home():
     return "Crypto Flow Bot is running."
 
 
-@app.route("/health")
+@flask_app.route("/health")
 def health():
-    return jsonify({
-        "status": "online",
-        "bot": "Crypto Flow Bot",
-        "time": datetime.utcnow().isoformat(),
-    })
+    return "OK"
 
 
-# =========================================================
-# SYMBOL HELPERS
-# =========================================================
+def run_web_server():
+    flask_app.run(
+        host="0.0.0.0",
+        port=PORT,
+        use_reloader=False,
+    )
+
+
+# ============================================================
+# HELP
+# ============================================================
+
+HELP_TEXT = """
+🤖 Crypto Flow Bot
+
+Send a symbol to analyze it.
+
+Examples:
+XAUUSD
+EUR/USD
+GBP/USD
+USD/JPY
+BTC/USD
+ETH/USD
+
+📸 You can also send a chart screenshot.
+
+The bot returns:
+
+🟢 BUY
+🔴 SELL
+🟡 WAIT
+
+Confidence %
+Entry
+Buy Limit
+Sell Limit
+SL
+TP1
+TP2
+Target Pips
+Support
+Resistance
+"""
+
+
+# ============================================================
+# SYMBOL NORMALIZATION
+# ============================================================
 
 def normalize_symbol(symbol: str) -> str:
-
     symbol = symbol.strip().upper()
 
-    replacements = {
+    symbol = symbol.replace(" ", "")
+    symbol = symbol.replace("-", "/")
+    symbol = symbol.replace("_", "/")
+
+    aliases = {
         "XAUUSD": "XAU/USD",
-        "GOLD": "XAU/USD",
-        "XAU/USD": "XAU/USD",
-
-        "BTC": "BTC/USD",
-        "BTCUSD": "BTC/USD",
-
-        "ETH": "ETH/USD",
-        "ETHUSD": "ETH/USD",
-
+        "XAGUSD": "XAG/USD",
         "EURUSD": "EUR/USD",
         "GBPUSD": "GBP/USD",
         "USDJPY": "USD/JPY",
-        "AUDUSD": "AUD/USD",
-        "USDCAD": "USD/CAD",
         "USDCHF": "USD/CHF",
+        "AUDUSD": "AUD/USD",
         "NZDUSD": "NZD/USD",
+        "USDCAD": "USD/CAD",
+
+        "BTCUSD": "BTC/USD",
+        "BTCUSDT": "BTC/USD",
+        "ETHUSD": "ETH/USD",
+        "ETHUSDT": "ETH/USD",
+        "BNBUSD": "BNB/USD",
+        "SOLUSD": "SOL/USD",
+        "XRPUSD": "XRP/USD",
+        "ADAUSD": "ADA/USD",
+        "DOGEUSD": "DOGE/USD",
     }
 
-    return replacements.get(symbol, symbol)
+    return aliases.get(symbol, symbol)
 
 
-def pip_size(symbol: str) -> float:
+# ============================================================
+# PIP SIZE
+# ============================================================
 
-    symbol = symbol.upper()
+def get_pip_size(symbol: str) -> float:
+    s = symbol.upper()
 
-    if "XAU" in symbol or "GOLD" in symbol:
+    # Gold / Silver
+    if "XAU" in s:
         return 0.01
 
-    if "JPY" in symbol:
+    if "XAG" in s:
+        return 0.001
+
+    # JPY forex pairs
+    if "JPY" in s:
+        return 0.01
+
+    # Most forex
+    if "/" in s and len(s.split("/")[0]) == 3:
+        return 0.0001
+
+    # Crypto
+    if any(x in s for x in ["BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE"]):
         return 0.01
 
     return 0.0001
 
 
-def price_decimals(symbol: str) -> int:
+def price_to_pips(price_distance: float, symbol: str) -> float:
+    pip_size = get_pip_size(symbol)
 
-    symbol = symbol.upper()
+    if pip_size <= 0:
+        return 0
 
-    if "JPY" in symbol:
-        return 3
-
-    if "XAU" in symbol or "GOLD" in symbol:
-        return 2
-
-    return 5
+    return abs(price_distance) / pip_size
 
 
-def fmt_price(value, symbol: str) -> str:
-
-    if value is None:
-        return "-"
-
-    return f"{float(value):.{price_decimals(symbol)}f}"
+def pips_to_price(pips: float, symbol: str) -> float:
+    return pips * get_pip_size(symbol)
 
 
-# =========================================================
+# ============================================================
 # TWELVE DATA
-# =========================================================
+# ============================================================
 
-def get_market_data(
-    symbol: str,
-    interval: str = "15min",
-    outputsize: int = 200,
-):
+def get_market_data(symbol: str) -> Optional[pd.DataFrame]:
 
     if not TWELVE_DATA_KEY:
-        raise RuntimeError(
-            "TWELVE_DATA_KEY is missing."
+        return None
+
+    try:
+        url = "https://api.twelvedata.com/time_series"
+
+        params = {
+            "symbol": symbol,
+            "interval": TIMEFRAME,
+            "outputsize": 200,
+            "apikey": TWELVE_DATA_KEY,
+        }
+
+        response = requests.get(
+            url,
+            params=params,
+            timeout=20,
         )
 
-    cache_key = f"{symbol}_{interval}"
+        data = response.json()
 
-    cached = DATA_CACHE.get(cache_key)
+        if "values" not in data:
+            logger.warning("Twelve Data error: %s", data)
+            return None
 
-    if cached:
+        df = pd.DataFrame(data["values"])
 
-        age = (
-            datetime.utcnow() - cached["time"]
-        ).total_seconds()
+        if df.empty:
+            return None
 
-        if age < CACHE_SECONDS:
-            return cached["data"].copy()
+        for col in ["open", "high", "low", "close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    url = "https://api.twelvedata.com/time_series"
+        df = df.sort_values("datetime").reset_index(drop=True)
 
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVE_DATA_KEY,
-        "format": "JSON",
-    }
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=20,
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if "values" not in data:
-
-        raise RuntimeError(
-            data.get(
-                "message",
-                "No market data returned.",
-            )
+        df.dropna(
+            subset=["open", "high", "low", "close"],
+            inplace=True,
         )
 
-    df = pd.DataFrame(data["values"])
+        return df
 
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-    ]:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
-
-    df["datetime"] = pd.to_datetime(
-        df["datetime"],
-        errors="coerce",
-    )
-
-    df = df.dropna(
-        subset=[
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
-    )
-
-    df = (
-        df.sort_values("datetime")
-        .reset_index(drop=True)
-    )
-
-    DATA_CACHE[cache_key] = {
-        "time": datetime.utcnow(),
-        "data": df.copy(),
-    }
-
-    return df
+    except Exception:
+        logger.exception("Market data error")
+        return None
 
 
-# =========================================================
-# INDICATORS
-# =========================================================
+# ============================================================
+# TECHNICAL INDICATORS
+# ============================================================
 
-def calculate_indicators(df):
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
@@ -279,14 +292,25 @@ def calculate_indicators(df):
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
 
-    rs = avg_gain / avg_loss.replace(
-        0,
-        math.nan,
-    )
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
 
     df["RSI"] = 100 - (
         100 / (1 + rs)
     )
+
+    # ATR
+    previous_close = df["close"].shift(1)
+
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - previous_close).abs()
+    tr3 = (df["low"] - previous_close).abs()
+
+    tr = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1,
+    ).max(axis=1)
+
+    df["ATR"] = tr.rolling(14).mean()
 
     # MACD
     ema12 = df["close"].ewm(
@@ -301,1085 +325,496 @@ def calculate_indicators(df):
 
     df["MACD"] = ema12 - ema26
 
-    df["MACD_SIGNAL"] = (
-        df["MACD"]
-        .ewm(
-            span=9,
-            adjust=False,
-        )
-        .mean()
-    )
-
-    df["MACD_HIST"] = (
-        df["MACD"] -
-        df["MACD_SIGNAL"]
-    )
-
-    # ATR
-    previous_close = df["close"].shift(1)
-
-    tr1 = df["high"] - df["low"]
-
-    tr2 = (
-        df["high"] -
-        previous_close
-    ).abs()
-
-    tr3 = (
-        df["low"] -
-        previous_close
-    ).abs()
-
-    tr = pd.concat(
-        [tr1, tr2, tr3],
-        axis=1,
-    ).max(axis=1)
-
-    df["ATR"] = tr.rolling(14).mean()
+    df["MACD_SIGNAL"] = df["MACD"].ewm(
+        span=9,
+        adjust=False,
+    ).mean()
 
     return df
 
 
-# =========================================================
-# SUPPORT / RESISTANCE
-# =========================================================
+# ============================================================
+# MARKET SIGNAL
+# ============================================================
 
-def support_resistance(df):
-
-    recent = df.tail(50)
-
-    support = float(
-        recent["low"].min()
-    )
-
-    resistance = float(
-        recent["high"].max()
-    )
-
-    return support, resistance
-
-
-# =========================================================
-# MARKET STRUCTURE
-# =========================================================
-
-def market_structure(df):
-
-    recent = df.tail(20)
-
-    if len(recent) < 6:
-        return "UNKNOWN"
-
-    highs = recent["high"].values
-    lows = recent["low"].values
-
-    last_high = highs[-1]
-    previous_high = highs[-4]
-
-    last_low = lows[-1]
-    previous_low = lows[-4]
-
-    if (
-        last_high > previous_high
-        and last_low > previous_low
-    ):
-        return "HH / HL"
-
-    if (
-        last_high < previous_high
-        and last_low < previous_low
-    ):
-        return "LH / LL"
-
-    return "RANGE"
-
-
-# =========================================================
-# CANDLE
-# =========================================================
-
-def candle_analysis(df):
-
-    last = df.iloc[-1]
-
-    body = abs(
-        last["close"] -
-        last["open"]
-    )
-
-    upper_wick = (
-        last["high"] -
-        max(
-            last["open"],
-            last["close"],
-        )
-    )
-
-    lower_wick = (
-        min(
-            last["open"],
-            last["close"],
-        ) -
-        last["low"]
-    )
-
-    if body == 0:
-        return "DOJI"
-
-    if (
-        lower_wick > body * 2
-        and last["close"] > last["open"]
-    ):
-        return "BULLISH REJECTION"
-
-    if (
-        upper_wick > body * 2
-        and last["close"] < last["open"]
-    ):
-        return "BEARISH REJECTION"
-
-    if last["close"] > last["open"]:
-        return "BULLISH"
-
-    return "BEARISH"
-
-
-# =========================================================
-# MARKET ANALYSIS
-# =========================================================
-
-def analyze_market(df, symbol):
+def calculate_signal(
+    df: pd.DataFrame,
+    symbol: str,
+):
 
     df = calculate_indicators(df)
 
-    last = df.iloc[-1]
-    previous = df.iloc[-2]
+    latest = df.iloc[-1]
 
-    price = float(last["close"])
-
-    ema20 = float(last["EMA20"])
-    ema50 = float(last["EMA50"])
-    ema200 = float(last["EMA200"])
-
-    rsi = float(last["RSI"])
-    macd = float(last["MACD"])
-    macd_signal = float(
-        last["MACD_SIGNAL"]
-    )
-
-    atr = float(last["ATR"])
+    price = float(latest["close"])
+    ema20 = float(latest["EMA20"])
+    ema50 = float(latest["EMA50"])
+    ema200 = float(latest["EMA200"])
+    rsi = float(latest["RSI"])
+    atr = float(latest["ATR"])
 
     buy_score = 0
     sell_score = 0
 
-    # EMA 20 / 50
+    # EMA trend
     if ema20 > ema50:
-        buy_score += 20
+        buy_score += 25
 
-    elif ema20 < ema50:
-        sell_score += 20
+    if ema20 < ema50:
+        sell_score += 25
 
-    # EMA 200
+    # Long-term trend
     if price > ema200:
         buy_score += 15
 
-    elif price < ema200:
+    if price < ema200:
         sell_score += 15
 
-    # Price / EMA20
+    # Price location
     if price > ema20:
-        buy_score += 10
-
-    elif price < ema20:
-        sell_score += 10
-
-    # RSI
-    if 52 <= rsi <= 70:
         buy_score += 15
 
-    elif 30 <= rsi <= 48:
+    if price < ema20:
+        sell_score += 15
+
+    # RSI
+    if 52 <= rsi <= 68:
+        buy_score += 15
+
+    if 32 <= rsi <= 48:
         sell_score += 15
 
     # MACD
-    if macd > macd_signal:
+    if latest["MACD"] > latest["MACD_SIGNAL"]:
         buy_score += 15
 
-    elif macd < macd_signal:
+    if latest["MACD"] < latest["MACD_SIGNAL"]:
         sell_score += 15
 
     # Momentum
-    if price > float(previous["close"]):
-        buy_score += 10
-
-    elif price < float(previous["close"]):
-        sell_score += 10
-
-    # Structure
-    structure = market_structure(df)
-
-    if structure == "HH / HL":
+    if df["close"].iloc[-1] > df["close"].iloc[-2]:
         buy_score += 15
 
-    elif structure == "LH / LL":
+    if df["close"].iloc[-1] < df["close"].iloc[-2]:
         sell_score += 15
 
-    # Direction
+    # --------------------------------------------------------
+    # Confidence
+    # --------------------------------------------------------
+
     if buy_score > sell_score:
-        direction = "BUY"
+        signal = "BUY"
+        confidence = min(95, 50 + buy_score / 2)
 
     elif sell_score > buy_score:
-        direction = "SELL"
+        signal = "SELL"
+        confidence = min(95, 50 + sell_score / 2)
 
     else:
-        direction = "WAIT"
+        signal = "WAIT"
+        confidence = 50
 
-    confidence = min(
-        100,
-        max(
-            buy_score,
-            sell_score,
-        ),
+    confidence = round(confidence)
+
+    # --------------------------------------------------------
+    # Support / resistance
+    # --------------------------------------------------------
+
+    recent = df.tail(50)
+
+    support = float(recent["low"].min())
+    resistance = float(recent["high"].max())
+
+    # --------------------------------------------------------
+    # Make target at least 50 pips
+    # --------------------------------------------------------
+
+    minimum_price_distance = pips_to_price(
+        MIN_TARGET_PIPS,
+        symbol,
     )
 
-    support, resistance = (
-        support_resistance(df)
+    # ATR based target
+    target_distance = max(
+        atr * 2.0,
+        minimum_price_distance,
     )
 
-    candle = candle_analysis(df)
-
-    # =====================================================
-    # TARGET DISTANCE
-    # =====================================================
-
-    minimum_distance = (
-        MIN_TARGET_PIPS *
-        pip_size(symbol)
+    stop_distance = max(
+        atr * 1.0,
+        pips_to_price(30, symbol),
     )
 
-    atr_distance = atr * 1.5
+    # --------------------------------------------------------
+    # Trade levels
+    # --------------------------------------------------------
 
-    distance = max(
-        minimum_distance,
-        atr_distance,
-    )
-
-    # =====================================================
-    # TRADE LEVELS
-    # =====================================================
-
-    if direction == "BUY":
+    if signal == "BUY":
 
         entry = price
 
-        sl = entry - distance
-
-        tp1 = entry + (
-            distance * 1.5
-        )
-
-        tp2 = entry + (
-            distance * 2.5
-        )
-
         buy_limit = max(
             support,
-            entry - (
-                distance * 0.35
-            ),
+            price - atr * 0.5,
         )
 
         sell_limit = None
 
-    elif direction == "SELL":
+        sl = entry - stop_distance
+
+        tp1 = entry + target_distance
+        tp2 = entry + target_distance * 1.6
+
+    elif signal == "SELL":
 
         entry = price
 
-        sl = entry + distance
-
-        tp1 = entry - (
-            distance * 1.5
-        )
-
-        tp2 = entry - (
-            distance * 2.5
-        )
-
         sell_limit = min(
             resistance,
-            entry + (
-                distance * 0.35
-            ),
+            price + atr * 0.5,
         )
 
         buy_limit = None
 
+        sl = entry + stop_distance
+
+        tp1 = entry - target_distance
+        tp2 = entry - target_distance * 1.6
+
     else:
 
         entry = price
+
+        buy_limit = None
+        sell_limit = None
 
         sl = None
         tp1 = None
         tp2 = None
 
-        buy_limit = support
-        sell_limit = resistance
+    target_pips = price_to_pips(
+        target_distance,
+        symbol,
+    )
 
     return {
-        "symbol": symbol,
-        "price": price,
-        "direction": direction,
+        "signal": signal,
         "confidence": confidence,
-        "structure": structure,
-        "candle": candle,
-        "support": support,
-        "resistance": resistance,
+        "price": price,
         "ema20": ema20,
         "ema50": ema50,
         "ema200": ema200,
         "rsi": rsi,
-        "macd": macd,
-        "macd_signal": macd_signal,
         "atr": atr,
+        "support": support,
+        "resistance": resistance,
         "entry": entry,
+        "buy_limit": buy_limit,
+        "sell_limit": sell_limit,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "buy_limit": buy_limit,
-        "sell_limit": sell_limit,
-        "distance": distance,
-        "target_pips": (
-            distance /
-            pip_size(symbol)
-        ),
+        "target_pips": target_pips,
     }
 
 
-# =========================================================
-# TELEGRAM MARKET SIGNAL
-# =========================================================
+# ============================================================
+# FORMAT NUMBER
+# ============================================================
 
-def format_signal(result):
+def fmt(value):
 
-    symbol = result["symbol"]
-    direction = result["direction"]
-    confidence = result["confidence"]
+    if value is None:
+        return "N/A"
 
-    if direction == "BUY":
-        emoji = "🟢"
+    if abs(value) >= 100:
+        return f"{value:,.2f}"
 
-    elif direction == "SELL":
-        emoji = "🔴"
+    return f"{value:.5f}".rstrip("0").rstrip(".")
 
-    else:
-        emoji = "🟡"
 
-    text = (
-        "📊 MARKET ANALYSIS\n\n"
-        f"💱 Symbol: {symbol}\n"
-        f"{emoji} Signal: {direction}\n"
-        f"🎯 Confidence: {confidence}%\n\n"
+# ============================================================
+# TEXT MARKET ANALYSIS
+# ============================================================
 
-        f"📌 Structure: {result['structure']}\n"
-        f"🕯 Candle: {result['candle']}\n\n"
+def text_analysis(symbol: str):
 
-        f"📈 EMA20: "
-        f"{fmt_price(result['ema20'], symbol)}\n"
+    df = get_market_data(symbol)
 
-        f"📈 EMA50: "
-        f"{fmt_price(result['ema50'], symbol)}\n"
-
-        f"📈 EMA200: "
-        f"{fmt_price(result['ema200'], symbol)}\n"
-
-        f"📊 RSI: {result['rsi']:.1f}\n\n"
-
-        f"🧱 Support: "
-        f"{fmt_price(result['support'], symbol)}\n"
-
-        f"🧱 Resistance: "
-        f"{fmt_price(result['resistance'], symbol)}\n\n"
-    )
-
-    if direction == "BUY":
-
-        text += (
-            f"🎯 Entry: "
-            f"{fmt_price(result['entry'], symbol)}\n"
-
-            f"🟢 Buy Limit: "
-            f"{fmt_price(result['buy_limit'], symbol)}\n"
-
-            f"🛑 SL: "
-            f"{fmt_price(result['sl'], symbol)}\n"
-
-            f"🎯 TP1: "
-            f"{fmt_price(result['tp1'], symbol)}\n"
-
-            f"🎯 TP2: "
-            f"{fmt_price(result['tp2'], symbol)}\n\n"
-        )
-
-    elif direction == "SELL":
-
-        text += (
-            f"🎯 Entry: "
-            f"{fmt_price(result['entry'], symbol)}\n"
-
-            f"🔴 Sell Limit: "
-            f"{fmt_price(result['sell_limit'], symbol)}\n"
-
-            f"🛑 SL: "
-            f"{fmt_price(result['sl'], symbol)}\n"
-
-            f"🎯 TP1: "
-            f"{fmt_price(result['tp1'], symbol)}\n"
-
-            f"🎯 TP2: "
-            f"{fmt_price(result['tp2'], symbol)}\n\n"
-        )
-
-    else:
-
-        text += (
-            "🟡 MARKET: WAIT\n\n"
-
-            f"🟢 Buy Limit area: "
-            f"{fmt_price(result['buy_limit'], symbol)}\n"
-
-            f"🔴 Sell Limit area: "
-            f"{fmt_price(result['sell_limit'], symbol)}\n\n"
-        )
-
-    text += (
-        f"📏 Target: "
-        f"{result['target_pips']:.0f} pips\n\n"
-    )
-
-    if confidence >= MIN_CONFIDENCE:
-
-        text += (
-            "🟢 GOOD MARKET CONDITION\n"
-            "Indicators are aligned."
-        )
-
-    else:
-
-        text += (
-            "🟡 WEAK MARKET CONDITION\n"
-            "Wait for confirmation."
-        )
-
-    text += (
-        "\n\n⚠️ Educational analysis only."
-    )
-
-    return text
-
-
-# =========================================================
-# START
-# =========================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    text = (
-        "🤖 Crypto Flow Bot\n\n"
-        "Send a symbol to analyze it.\n\n"
-
-        "Examples:\n"
-        "XAUUSD\n"
-        "EUR/USD\n"
-        "GBP/USD\n"
-        "BTC/USD\n"
-        "ETH/USD\n\n"
-
-        "📸 You can also send a chart screenshot."
-    )
-
-    await update.message.reply_text(text)
-
-
-# =========================================================
-# HELP
-# =========================================================
-
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    text = (
-        "📚 HELP\n\n"
-
-        "/start - Start bot\n"
-        "/help - Help\n"
-        "/analyze XAUUSD - Analyze symbol\n\n"
-
-        "Or simply send:\n"
-        "XAUUSD\n"
-        "EUR/USD\n"
-        "BTC/USD\n\n"
-
-        "📸 Send a chart screenshot for AI analysis."
-    )
-
-    await update.message.reply_text(text)
-
-
-# =========================================================
-# ANALYZE COMMAND
-# =========================================================
-
-async def analyze_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Example: /analyze XAUUSD"
-        )
-
-        return
-
-    symbol = normalize_symbol(
-        context.args[0]
-    )
-
-    await analyze_and_reply(
-        update,
-        symbol,
-    )
-
-
-# =========================================================
-# TEXT SYMBOL
-# =========================================================
-
-async def text_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-        return
-
-    text = (
-        update.message.text or ""
-    ).strip()
-
-    if not text:
-        return
-
-    if len(text) > 30:
-        return
-
-    symbol = normalize_symbol(text)
-
-    await analyze_and_reply(
-        update,
-        symbol,
-    )
-
-
-# =========================================================
-# MARKET ANALYSIS REPLY
-# =========================================================
-
-async def analyze_and_reply(
-    update: Update,
-    symbol: str,
-):
-
-    status = await update.message.reply_text(
-        f"🔎 Analyzing {symbol}...\n"
-        "15M + 1H data loading..."
-    )
-
-    try:
-
-        df15 = get_market_data(
-            symbol,
-            "15min",
-            200,
-        )
-
-        result = analyze_market(
-            df15,
-            symbol,
-        )
-
-        # 1H confirmation
-        try:
-
-            df1h = get_market_data(
-                symbol,
-                "1h",
-                200,
-            )
-
-            result_1h = analyze_market(
-                df1h,
-                symbol,
-            )
-
-            if (
-                result["direction"]
-                == result_1h["direction"]
-            ):
-
-                result["confidence"] = min(
-                    100,
-                    result["confidence"] + 10,
-                )
-
-            else:
-
-                result["confidence"] = max(
-                    0,
-                    result["confidence"] - 10,
-                )
-
-        except Exception as e:
-
-            logger.warning(
-                "1H analysis failed: %s",
-                e,
-            )
-
-        text = format_signal(result)
-
-        # IMPORTANT:
-        # No Markdown parsing here.
-        await status.edit_text(text)
-
-    except Exception as e:
-
-        logger.exception(
-            "Analysis error"
-        )
-
-        await status.edit_text(
-            "❌ Analysis failed.\n\n"
-            f"Reason: {str(e)[:500]}"
-        )
-
-
-# =========================================================
-# GROQ MODEL DETECTION
-# =========================================================
-
-def get_available_vision_model(client):
-
-    try:
-
-        models = client.models.list()
-
-        available = {
-            model.id
-            for model in models.data
-        }
-
-        for model_name in VISION_MODELS:
-
-            if model_name in available:
-
-                logger.info(
-                    "Using Groq vision model: %s",
-                    model_name,
-                )
-
-                return model_name
-
-    except Exception as e:
-
-        logger.warning(
-            "Could not list Groq models: %s",
-            e,
-        )
-
-    # Default current vision model
-    return "qwen/qwen3.6-27b"
-
-
-# =========================================================
-# GROQ IMAGE ANALYSIS
-# =========================================================
-
-def groq_analyze_image(
-    image_bytes: bytes,
-    symbol_hint: str = "",
-):
-
-    if not GROQ_API_KEY:
+    if df is None:
 
         return (
-            "❌ GROQ_API_KEY is not configured."
+            f"❌ No live market data found for {symbol}.\n\n"
+            "Check the symbol format or TWELVE_DATA_KEY."
         )
 
-    client = Groq(
-        api_key=GROQ_API_KEY
-    )
+    if len(df) < 50:
 
-    model = get_available_vision_model(
-        client
-    )
+        return (
+            f"❌ Not enough market data for {symbol}."
+        )
 
-    encoded = base64.b64encode(
+    try:
+
+        result = calculate_signal(
+            df,
+            symbol,
+        )
+
+        signal = result["signal"]
+        confidence = result["confidence"]
+
+        if signal == "BUY":
+            signal_text = "🟢 BUY"
+            market = "🟢 GOOD / BULLISH"
+
+        elif signal == "SELL":
+            signal_text = "🔴 SELL"
+            market = "🔴 BAD / BEARISH"
+
+        else:
+            signal_text = "🟡 WAIT"
+            market = "🟡 UNCERTAIN"
+
+        lines = [
+            "📊 CRYPTO FLOW SIGNAL",
+            "",
+            f"SYMBOL: {symbol}",
+            f"TIMEFRAME: {TIMEFRAME}",
+            "",
+            f"SIGNAL: {signal_text}",
+            f"CONFIDENCE: {confidence}%",
+            f"MARKET: {market}",
+            "",
+            f"ENTRY: {fmt(result['entry'])}",
+        ]
+
+        if signal == "BUY":
+
+            lines.append(
+                f"BUY LIMIT: {fmt(result['buy_limit'])}"
+            )
+
+            lines.append(
+                "SELL LIMIT: N/A"
+            )
+
+        elif signal == "SELL":
+
+            lines.append(
+                "BUY LIMIT: N/A"
+            )
+
+            lines.append(
+                f"SELL LIMIT: {fmt(result['sell_limit'])}"
+            )
+
+        else:
+
+            lines.append("BUY LIMIT: N/A")
+            lines.append("SELL LIMIT: N/A")
+
+        if signal != "WAIT":
+
+            lines.extend([
+                "",
+                f"SL: {fmt(result['sl'])}",
+                f"TP1: {fmt(result['tp1'])}",
+                f"TP2: {fmt(result['tp2'])}",
+                "",
+                f"🎯 TARGET: {result['target_pips']:.0f}+ PIPS",
+            ])
+
+        lines.extend([
+            "",
+            f"SUPPORT: {fmt(result['support'])}",
+            f"RESISTANCE: {fmt(result['resistance'])}",
+            "",
+            f"RSI: {result['rsi']:.1f}",
+            f"EMA20: {fmt(result['ema20'])}",
+            f"EMA50: {fmt(result['ema50'])}",
+            "",
+            "⚠️ Educational analysis only.",
+        ])
+
+        return "\n".join(lines)
+
+    except Exception as e:
+
+        logger.exception("Text analysis error")
+
+        return (
+            "❌ Analysis error.\n"
+            f"{str(e)[:500]}"
+        )
+
+
+# ============================================================
+# GROQ IMAGE ANALYSIS
+# ============================================================
+
+def encode_image(image_bytes: bytes) -> str:
+
+    return base64.b64encode(
         image_bytes
     ).decode("utf-8")
 
-    prompt = f"""
-Analyze this trading chart screenshot.
 
-Symbol hint: {symbol_hint or "unknown"}
+def get_image_mime(image_bytes: bytes) -> str:
 
-Give ONLY a short trading analysis.
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
 
-Use this exact format:
+    if image_bytes.startswith(b"\x89PNG"):
+        return "image/png"
 
-SYMBOL:
-TIMEFRAME:
-TREND:
-STRUCTURE:
-SUPPORT:
-RESISTANCE:
-SIGNAL:
-ENTRY:
-BUY LIMIT:
-SELL LIMIT:
-SL:
-TP1:
-TP2:
-TARGET PIPS:
-CONFIDENCE:
+    if image_bytes.startswith(b"GIF"):
+        return "image/gif"
 
-Rules:
-- Do not invent indicators that are not visible.
-- If an exact price cannot be read, write "Not clear".
-- Keep the entire answer under 500 words.
-- No long explanation.
-- No introduction.
-- No conclusion.
-- Focus on the chart.
+    if image_bytes.startswith(b"RIFF"):
+        return "image/webp"
+
+    return "image/jpeg"
+
+
+def clean_ai_text(text: str) -> str:
+
+    if not text:
+        return "No analysis returned."
+
+    # Remove markdown formatting that can cause Telegram entity errors
+    text = text.replace("```", "")
+    text = text.replace("**", "")
+    text = text.replace("__", "")
+
+    return text.strip()
+
+
+def analyze_chart_with_groq(
+    image_bytes: bytes,
+    caption: str = "",
+) -> str:
+
+    if not groq_client:
+        return "❌ GROQ_API_KEY is missing."
+
+    base64_image = encode_image(
+        image_bytes
+    )
+
+    mime = get_image_mime(
+        image_bytes
+    )
+
+    prompt = """
+Analyze this trading chart.
+
+Return ONLY this short format.
+Do NOT explain the reasoning.
+Do NOT use markdown.
+Do NOT use tables.
+
+SIGNAL: BUY or SELL or WAIT
+CONFIDENCE: number%
+SYMBOL: symbol
+TIMEFRAME: timeframe
+ENTRY: price
+BUY LIMIT: price or N/A
+SELL LIMIT: price or N/A
+SL: price or N/A
+TP1: price or N/A
+TP2: price or N/A
+TARGET PIPS: number
+SUPPORT: price
+RESISTANCE: price
+MARKET: GOOD or BAD or UNCERTAIN
+REASON: one short sentence
+
+Important:
+- Give a clear BUY, SELL, or WAIT.
+- Do not write "Buy on Pullback" instead of BUY.
+- Do not write "Sell on Breakout" instead of SELL.
+- TARGET PIPS must be at least 50 when a BUY or SELL setup is identified.
+- For XAUUSD, 0.01 price movement = 1 pip.
+- If indicators are not visible, do not invent them.
+- Keep the complete answer under 600 tokens.
 """
+
+    if caption:
+        prompt += (
+            "\nUser caption/symbol: "
+            + caption[:100]
+        )
 
     try:
 
-        completion = client.chat.completions.create(
-
-            model=model,
+        response = groq_client.chat.completions.create(
+            model=GROQ_VISION_MODEL,
 
             messages=[
                 {
+                    "role": "system",
+                    "content": (
+                        "You are a concise chart-analysis assistant. "
+                        "Return only the requested fields."
+                    ),
+                },
+                {
                     "role": "user",
-
                     "content": [
                         {
                             "type": "text",
                             "text": prompt,
                         },
-
                         {
                             "type": "image_url",
-
                             "image_url": {
-                                "url":
-                                "data:image/jpeg;base64,"
-                                + encoded
+                                "url": (
+                                    f"data:{mime};base64,"
+                                    f"{base64_image}"
+                                )
                             },
                         },
                     ],
-                }
+                },
             ],
 
             temperature=0.2,
 
-            # IMPORTANT:
-            # Keep below the 1000 token limit
-            # shown in your previous error.
-            max_completion_tokens=800,
+            # Important: keep below the user's current 1000-token
+            # output-per-minute limit.
+            max_completion_tokens=700,
+
+            top_p=0.8,
+
+            stream=False,
         )
 
-        return (
-            completion
-            .choices[0]
-            .message
-            .content
-            .strip()
-        )
+        result = response.choices[0].message.content
 
-    except Exception as first_error:
-
-        logger.warning(
-            "Primary vision model failed: %s",
-            first_error,
-        )
-
-        # Try the second vision model
-        for fallback_model in VISION_MODELS:
-
-            if fallback_model == model:
-                continue
-
-            try:
-
-                logger.info(
-                    "Trying fallback model: %s",
-                    fallback_model,
-                )
-
-                completion = (
-                    client.chat.completions.create(
-
-                        model=fallback_model,
-
-                        messages=[
-                            {
-                                "role": "user",
-
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": prompt,
-                                    },
-
-                                    {
-                                        "type":
-                                        "image_url",
-
-                                        "image_url": {
-                                            "url":
-                                            "data:image/jpeg;base64,"
-                                            + encoded
-                                        },
-                                    },
-                                ],
-                            }
-                        ],
-
-                        temperature=0.2,
-
-                        max_completion_tokens=800,
-                    )
-                )
-
-                return (
-                    completion
-                    .choices[0]
-                    .message
-                    .content
-                    .strip()
-                )
-
-            except Exception as fallback_error:
-
-                logger.warning(
-                    "Fallback model failed: %s",
-                    fallback_error,
-                )
-
-        return (
-            "❌ Groq chart analysis failed.\n\n"
-            f"{str(first_error)[:700]}"
-        )
-
-
-# =========================================================
-# TELEGRAM PHOTO
-# =========================================================
-
-async def photo_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not update.message:
-        return
-
-    if not update.message.photo:
-        return
-
-    wait = await update.message.reply_text(
-        "📸 Chart received.\n"
-        "🤖 AI is analyzing..."
-    )
-
-    try:
-
-        photo = update.message.photo[-1]
-
-        file = await context.bot.get_file(
-            photo.file_id
-        )
-
-        buffer = io.BytesIO()
-
-        await file.download_to_memory(
-            buffer
-        )
-
-        image_bytes = (
-            buffer.getvalue()
-        )
-
-        caption = (
-            update.message.caption
-            or ""
-        )
-
-        result = groq_analyze_image(
-            image_bytes,
-            caption,
-        )
-
-        # IMPORTANT:
-        # DO NOT use parse_mode="Markdown"
-        # for AI generated text.
-        await wait.edit_text(
-            "📊 AI CHART ANALYSIS\n\n"
-            + result
-            + "\n\n⚠️ Educational analysis only."
-        )
+        return clean_ai_text(result)
 
     except Exception as e:
 
-        logger.exception(
-            "Image analysis error"
-        )
+        logger.exception("Groq chart analysis error")
 
-        await wait.edit_text(
-            "❌ Chart analysis failed.\n\n"
-            f"Error: {str(e)[:700]}"
-        )
+        error_text = str(e)
 
+        if "429" in error_text:
 
-# =========================================================
-# TELEGRAM ERROR
-# =========================================================
+            return (
+                "❌ Groq rate limit reached.\n\n"
+                "The request was too large. "
+                "The bot is already configured with a smaller "
+                "output limit. Wait a little and send the chart again."
+            )
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+        if "model_not_found" in error_text:
 
-    logger.error(
-        "Telegram error: %s",
-        context.error,
-    )
+            return (
+                "❌ Groq model error.\n\n"
+                "Check GROQ_API_KEY and the current Groq model access."
+            )
 
-
-# =========================================================
-# FLASK THREAD
-# =========================================================
-
-def run_flask():
-
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        use_reloader=False,
-    )
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    if not TELEGRAM_BOT_TOKEN:
-
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing."
-        )
-
-    if not TWELVE_DATA_KEY:
-
-        logger.warning(
-            "TWELVE_DATA_KEY is missing."
-        )
-
-    if not GROQ_API_KEY:
-
-        logger.warning(
-            "GROQ_API_KEY is missing."
-        )
-
-    # Render server
-    flask_thread = threading.Thread(
-        target=run_flask,
-        daemon=True,
-    )
-
-    flask_thread.start()
-
-    # Telegram
-    application = (
-        Application.builder()
-        .token(
-            TELEGRAM_BOT_TOKEN
-        )
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "help",
-            help_command,
-        )
-    )
-
-    application.add_handler(
-        CommandHandler(
-            "analyze",
-            analyze_command,
-        )
-    )
-
-    # PHOTO must come before TEXT
-    application.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            photo_handler,
-        )
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT
-            & ~filters.COMMAND,
-            text_message,
-        )
-    )
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    logger.info(
-        "Crypto Flow Bot starting..."
-    )
-
-    application.run_polling(
-        drop_pending_updates=True
-    )
-
-
-# =========================================================
-# START PROGRAM
-# =========================================================
-
-if __name__ == "__main__":
-    main()
+        return (
+           
