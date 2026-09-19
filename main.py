@@ -1,4 +1,5 @@
 import os
+import time
 import threading
 import logging
 from typing import Optional
@@ -16,7 +17,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -25,6 +26,7 @@ TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "").strip()
 
 TIMEFRAME = "15min"
 
+# Keep this small because Twelve Data has request limits.
 DEFAULT_SYMBOLS = [
     "BTC/USD",
     "ETH/USD",
@@ -38,14 +40,14 @@ TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
 # =========================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
 logger = logging.getLogger(__name__)
 
 # =========================================================
-# FLASK HEALTH SERVER
+# FLASK
 # =========================================================
 
 flask_app = Flask(__name__)
@@ -53,13 +55,11 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def home():
-    return jsonify(
-        {
-            "status": "online",
-            "service": "Crypto Market Telegram Bot",
-            "timeframe": TIMEFRAME,
-        }
-    )
+    return jsonify({
+        "status": "online",
+        "service": "Crypto Market Telegram Bot",
+        "timeframe": TIMEFRAME
+    })
 
 
 @flask_app.route("/health")
@@ -74,19 +74,15 @@ def run_flask():
         host="0.0.0.0",
         port=port,
         debug=False,
-        use_reloader=False,
+        use_reloader=False
     )
 
 
 # =========================================================
-# TELEGRAM SECURITY
+# AUTHORIZATION
 # =========================================================
 
 def authorized(update: Update) -> bool:
-    """
-    If TELEGRAM_CHAT_ID is configured, only that Telegram
-    chat can use the bot.
-    """
 
     if not TELEGRAM_CHAT_ID:
         return True
@@ -94,12 +90,11 @@ def authorized(update: Update) -> bool:
     if not update.effective_chat:
         return False
 
-    current_chat_id = str(update.effective_chat.id)
-
-    return current_chat_id == TELEGRAM_CHAT_ID
+    return str(update.effective_chat.id) == TELEGRAM_CHAT_ID
 
 
 async def deny(update: Update):
+
     if update.message:
         await update.message.reply_text(
             "⛔ This Telegram chat is not authorized."
@@ -107,135 +102,63 @@ async def deny(update: Update):
 
 
 # =========================================================
-# TWELVE DATA
+# API CACHE / RATE CONTROL
 # =========================================================
 
-def get_market_data(symbol: str) -> Optional[pd.DataFrame]:
-    if not TWELVE_DATA_KEY:
-        logger.error("TWELVE_DATA_KEY is missing.")
+CACHE = {}
+
+CACHE_SECONDS = 65
+
+API_LOCK = threading.Lock()
+
+LAST_API_REQUEST = 0.0
+
+MIN_SECONDS_BETWEEN_REQUESTS = 9
+
+
+def get_cached(symbol: str):
+
+    item = CACHE.get(symbol)
+
+    if not item:
         return None
 
-    params = {
-        "symbol": symbol,
-        "interval": TIMEFRAME,
-        "outputsize": 100,
-        "apikey": TWELVE_DATA_KEY,
-    }
+    timestamp, dataframe = item
 
-    try:
-        response = requests.get(
-            TWELVE_DATA_URL,
-            params=params,
-            timeout=20,
-        )
+    if time.time() - timestamp < CACHE_SECONDS:
+        return dataframe.copy()
 
-        response.raise_for_status()
+    return None
 
-        data = response.json()
 
-        if "status" in data and data["status"] == "error":
-            logger.error("Twelve Data error: %s", data)
-            return None
+def save_cache(symbol: str, dataframe: pd.DataFrame):
 
-        values = data.get("values")
+    CACHE[symbol] = (
+        time.time(),
+        dataframe.copy()
+    )
 
-        if not values:
-            logger.error("No market data returned for %s", symbol)
-            return None
 
-        df = pd.DataFrame(values)
+def wait_for_api_slot():
 
-        required_columns = [
-            "datetime",
-            "open",
-            "high",
-            "low",
-            "close",
-        ]
+    global LAST_API_REQUEST
 
-        for column in required_columns:
-            if column not in df.columns:
-                logger.error(
-                    "Missing column %s for %s",
-                    column,
-                    symbol,
-                )
-                return None
+    with API_LOCK:
 
-        for column in ["open", "high", "low", "close"]:
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce",
+        now = time.time()
+
+        elapsed = now - LAST_API_REQUEST
+
+        if elapsed < MIN_SECONDS_BETWEEN_REQUESTS:
+
+            wait_time = (
+                MIN_SECONDS_BETWEEN_REQUESTS
+                - elapsed
             )
 
-        df["datetime"] = pd.to_datetime(
-            df["datetime"],
-            errors="coerce",
-        )
+            logger.info(
+                "Waiting %.1f seconds before API request",
+                wait_time
+            )
 
-        df = df.dropna(
-            subset=[
-                "datetime",
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        )
-
-        df = df.sort_values("datetime").reset_index(drop=True)
-
-        return df
-
-    except requests.RequestException as exc:
-        logger.error(
-            "Network error for %s: %s",
-            symbol,
-            exc,
-        )
-        return None
-
-    except Exception as exc:
-        logger.exception(
-            "Unexpected market data error: %s",
-            exc,
-        )
-        return None
-
-
-# =========================================================
-# TECHNICAL ANALYSIS
-# =========================================================
-
-def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    average_gain = gain.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False,
-    ).mean()
-
-    average_loss = loss.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False,
-    ).mean()
-
-    rs = average_gain / average_loss.replace(0, pd.NA)
-
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi.fillna(50)
-
-
-def analyze_market(
-    df: pd.DataFrame,
-    symbol: str,
-) -> dict:
-
-    if len(df) < 30:
-        raise Value
+            time.sleep
