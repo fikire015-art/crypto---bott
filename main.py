@@ -1045,7 +1045,7 @@ async def photo_handler(
             "📊 *AI CHART ANALYSIS*\n\n"
             + result
             + "\n\n⚠️ Educational analysis only.",
-            parse_mode="Markdown"
+            
         )
 
     except Exception as e:
