@@ -45,7 +45,7 @@ from telegram.ext import (
 # - sends plain Telegram text to avoid Markdown entity errors
 # - includes a small HTTP health server for Render
 #
-# Educational analysis only. No automatic order execution.
+# Uses current market data when a symbol is requested. No automatic order execution.
 # ============================================================
 
 logging.basicConfig(
@@ -59,7 +59,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "").strip()
 
 # Current Groq vision model. Keep this exact model ID.
-VISION_MODEL = "qwen/qwen3.6-27b"
+VISION_MODELS = ["qwen/qwen3.6-27b", "qwen/qwen3.8-27b"]
 
 TIMEFRAME = "15min"
 CANDLE_COUNT = 150
@@ -524,7 +524,7 @@ def format_market_result(a: dict) -> str:
         f"SUPPORT: {fmt_price(a['support'])}",
         f"RESISTANCE: {fmt_price(a['resistance'])}",
         "",
-        "⚠️ Educational analysis only. No automatic trade is placed.",
+        "⚠️ Market data can change quickly. No automatic order is placed.",
     ]
 
     return "\n".join(lines)
@@ -541,32 +541,21 @@ def get_groq_client() -> Groq:
 
 
 def resize_image_bytes(image_bytes: bytes) -> bytes:
-    """
-    Resize/compress screenshots before sending them to Groq.
-    This reduces request size while preserving chart readability.
-    """
+    """Resize/compress a Telegram chart screenshot before sending it to Groq."""
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
     max_width = 1800
     if image.width > max_width:
         ratio = max_width / image.width
-        image = image.resize(
-            (max_width, int(image.height * ratio)),
-            Image.LANCZOS,
-        )
-
+        image = image.resize((max_width, int(image.height * ratio)), Image.LANCZOS)
     out = io.BytesIO()
     image.save(out, format="JPEG", quality=82, optimize=True)
     return out.getvalue()
 
 
 def vision_prompt(caption: str) -> str:
-    return f"""
-Analyze this trading chart screenshot for {caption or 'the visible symbol'}.
+    return f"""Analyze this trading chart screenshot for {caption or 'the visible symbol'}.
 
-Return ONLY a short plain-text report. No Markdown, no tables, no long explanation.
-
-Use exactly these labels:
+Return a SHORT plain-text report using exactly these labels:
 SYMBOL:
 TIMEFRAME:
 TREND:
@@ -585,49 +574,70 @@ REASON:
 
 Rules:
 - SIGNAL must be exactly BUY, SELL, or WAIT.
-- CONFIDENCE must be a number from 0 to 100 followed by %.
-- If the chart does not clearly show an indicator, say "Not visible".
-- Do not invent EMA/RSI/MACD values that are not visible.
-- Estimate levels from visible price structure only.
-- For XAUUSD/forex, try to give a target of at least 50 pips when the visible chart range supports it.
-- If a 50+ pip target is not supported by the visible chart, say so instead of inventing one.
-- Keep the entire answer under 500 words.
-- This is educational market analysis, not an automatic trading instruction.
+- CONFIDENCE must be 0-100%.
+- Do not invent indicators or prices that are not visible.
+- If an indicator is not visible, write Not visible.
+- For XAUUSD/forex, target 50+ pips only when the visible price structure supports it.
+- Keep the answer concise, under 350 words.
 """.strip()
+
+
+def available_vision_model(client: Groq) -> str:
+    """Use a currently available Groq vision model, with a safe fallback."""
+    try:
+        models = client.models.list()
+        ids = {m.id for m in getattr(models, "data", [])}
+        for model_id in VISION_MODELS:
+            if model_id in ids:
+                return model_id
+    except Exception as e:
+        logger.warning("Could not list Groq models: %s", e)
+    # Groq's current vision docs list both of these models.
+    return VISION_MODELS[0]
 
 
 def analyze_chart_with_groq(image_bytes: bytes, caption: str) -> str:
     client = get_groq_client()
     compressed = resize_image_bytes(image_bytes)
-
     encoded = base64.b64encode(compressed).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{encoded}"
 
-    response = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": [
+    first_model = available_vision_model(client)
+    models_to_try = [first_model] + [m for m in VISION_MODELS if m != first_model]
+    last_error = None
+
+    for model_id in models_to_try:
+        try:
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=[
                     {
-                        "type": "text",
-                        "text": vision_prompt(caption),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{encoded}",
-                        },
-                    },
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_prompt(caption)},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": data_url},
+                            },
+                        ],
+                    }
                 ],
-            }
-        ],
-        temperature=0.2,
-        max_completion_tokens=VISION_MAX_TOKENS,
-        stream=False,
-    )
+                temperature=0.2,
+                max_completion_tokens=VISION_MAX_TOKENS,
+                stream=False,
+            )
+            text = response.choices[0].message.content or ""
+            if text.strip():
+                logger.info("Vision analysis succeeded with %s", model_id)
+                return text.strip()
+            raise RuntimeError("Groq returned an empty analysis.")
+        except Exception as e:
+            last_error = e
+            logger.warning("Vision model %s failed: %s", model_id, e)
+            if "rate_limit" in str(e).lower():
+                raise
 
-    text = response.choices[0].message.content or ""
-    return text.strip()
+    raise RuntimeError(f"No available Groq vision model worked: {last_error}")
 
 
 # ============================================================
@@ -770,8 +780,8 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif "model_not_found" in error_text.lower():
             message = (
                 "❌ Chart analysis failed.\n\n"
-                "The Groq vision model ID is invalid or unavailable. "
-                "Check GROQ_API_KEY and use the current vision model."
+                "Groq rejected the vision model. The bot tried the current "
+                "Qwen vision models. Check GROQ_API_KEY access and redeploy."
             )
         else:
             message = (
