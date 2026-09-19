@@ -812,7 +812,7 @@ def main():
     web_thread.start()
 
     logger.info("Starting Crypto Flow Bot...")
-    logger.info("Vision model: %s", VISION_MODEL)
+    logger.info("Vision models: %s", ", ".join(VISION_MODELS))
 
     application = Application.builder().token(
         TELEGRAM_BOT_TOKEN
