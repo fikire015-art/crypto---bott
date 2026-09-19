@@ -71,7 +71,7 @@ MIN_TARGET_PIPS = 50
 
 # Keep Groq output short. This is important because the user's previous
 # account returned a 1000 output-tokens-per-minute limit.
-VISION_MAX_TOKENS = 650
+VISION_MAX_TOKENS = 400
 
 # ============================================================
 # Render health server
@@ -391,9 +391,9 @@ def analyze_market(df: pd.DataFrame, symbol: str) -> dict:
     total = max(buy_score, sell_score)
     confidence = int(min(95, max(50, 50 + total * 0.45)))
 
-    if buy_score >= sell_score + 10:
+    if buy_score >= sell_score + 5:
         signal = "BUY"
-    elif sell_score >= buy_score + 10:
+    elif sell_score >= buy_score + 5:
         signal = "SELL"
     else:
         signal = "WAIT"
@@ -555,7 +555,7 @@ def resize_image_bytes(image_bytes: bytes) -> bytes:
 def vision_prompt(caption: str) -> str:
     return f"""Analyze this trading chart screenshot for {caption or 'the visible symbol'}.
 
-Return a SHORT plain-text report using exactly these labels:
+Return ONLY these labels, one line each:
 SYMBOL:
 TIMEFRAME:
 TREND:
@@ -574,11 +574,12 @@ REASON:
 
 Rules:
 - SIGNAL must be exactly BUY, SELL, or WAIT.
+- Use BUY or SELL when the chart gives a clear directional setup; use WAIT only when direction is genuinely unclear.
 - CONFIDENCE must be 0-100%.
-- Do not invent indicators or prices that are not visible.
-- If an indicator is not visible, write Not visible.
-- For XAUUSD/forex, target 50+ pips only when the visible price structure supports it.
-- Keep the answer concise, under 350 words.
+- Never invent unreadable prices or indicators.
+- For XAUUSD/forex, show a 50+ pip target when the visible range/structure can reasonably support it.
+- Keep REASON to one short sentence.
+- Keep the whole answer under 220 words.
 """.strip()
 
 
@@ -758,9 +759,27 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not result:
             raise RuntimeError("Groq returned an empty analysis.")
 
+        # If the chart contains a recognizable symbol, also calculate the
+        # current market signal from live market candles. This prevents the
+        # screenshot model from being the only source for BUY/SELL.
+        live_block = ""
+        symbol_match = re.search(r"(?im)^\s*SYMBOL\s*:\s*([^\n]+)", result)
+        detected = normalize_symbol(symbol_match.group(1)) if symbol_match else ""
+        if detected and len(detected) >= 5:
+            try:
+                live_df = fetch_market_data(detected)
+                live = analyze_market(live_df, detected)
+                live_block = (
+                    "\n\n📡 LIVE MARKET SIGNAL\n\n"
+                    + format_market_result(live)
+                )
+            except Exception as live_error:
+                logger.warning("Live market overlay failed for %s: %s", detected, live_error)
+
         await status.edit_text(
-            "📊 AI CHART ANALYSIS\n\n" + result +
-            "\n\n⚠️ Educational analysis only."
+            "📊 AI CHART ANALYSIS\n\n" + result
+            + live_block
+            + "\n\n⚠️ Screenshot + market-data analysis; no automatic order is placed."
         )
 
     except Exception as e:
