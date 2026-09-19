@@ -1,573 +1,1180 @@
 import os
-import time
+import io
+import math
 import threading
-from datetime import datetime, timezone
+import logging
+from datetime import datetime
 
 import requests
-from flask import Flask, request, jsonify
+import pandas as pd
+from flask import Flask, jsonify
+
+from groq import Groq
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 
 # =========================================================
-# CONFIGURATION
+# CONFIG
 # =========================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-# Example:
-# BTC/USD,ETH/USD
-SYMBOLS = [
-    s.strip()
-    for s in os.getenv("SYMBOLS", "BTC/USD,ETH/USD").split(",")
-    if s.strip()
-]
+PORT = int(os.getenv("PORT", "10000"))
 
-TIMEFRAME = os.getenv("TIMEFRAME", "15min")
+TIMEFRAMES = {
+    "5m": "5min",
+    "15m": "15min",
+    "1h": "1h",
+}
 
-# Minimum seconds between Twelve Data requests for the same symbol
-REQUEST_COOLDOWN = int(os.getenv("REQUEST_COOLDOWN", "65"))
+DEFAULT_TIMEFRAME = "15m"
 
-# Cache
-cache = {}
-cache_lock = threading.Lock()
+MIN_CONFIDENCE = 70
 
+# Risk/target settings
+MIN_TARGET_PIPS = 50
+
+# XAUUSD pip assumption
+# 0.01 price movement = 1 pip
+XAU_PIP_SIZE = 0.01
+
+# API cache
+CACHE_SECONDS = 45
+DATA_CACHE = {}
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# FLASK - RENDER HEALTH SERVER
+# =========================================================
 
 app = Flask(__name__)
 
 
-# =========================================================
-# BASIC CHECK
-# =========================================================
-
-@app.get("/")
+@app.route("/")
 def home():
-    return jsonify({
-        "status": "online",
-        "bot": "Crypto Market Bot",
-        "time": datetime.now(timezone.utc).isoformat(),
-        "symbols": SYMBOLS,
-        "timeframe": TIMEFRAME
-    })
+    return "Crypto Flow Bot is running."
 
 
-@app.get("/health")
+@app.route("/health")
 def health():
-    return jsonify({"status": "healthy"})
-
-
-# =========================================================
-# TELEGRAM
-# =========================================================
-
-def telegram_api(method, payload=None):
-    if not TELEGRAM_BOT_TOKEN:
-        return {"ok": False, "description": "TELEGRAM_BOT_TOKEN is missing"}
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/{method}"
-    )
-
-    try:
-        response = requests.post(
-            url,
-            json=payload or {},
-            timeout=20
-        )
-
-        try:
-            return response.json()
-        except Exception:
-            return {
-                "ok": False,
-                "description": response.text
-            }
-
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "description": str(exc)
-        }
-
-
-def send_message(chat_id, text):
-    if not chat_id:
-        return
-
-    telegram_api(
-        "sendMessage",
+    return jsonify(
         {
-            "chat_id": chat_id,
-            "text": text
+            "status": "online",
+            "bot": "Crypto Flow Bot",
+            "time": datetime.utcnow().isoformat(),
         }
     )
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def normalize_symbol(symbol: str) -> str:
+    symbol = symbol.strip().upper()
+
+    replacements = {
+        "XAUUSD": "XAU/USD",
+        "XAU/USD": "XAU/USD",
+        "GOLD": "XAU/USD",
+        "BTC": "BTC/USD",
+        "ETH": "ETH/USD",
+    }
+
+    return replacements.get(symbol, symbol)
+
+
+def pip_size(symbol: str) -> float:
+    symbol = symbol.upper()
+
+    if "XAU" in symbol or "GOLD" in symbol:
+        return 0.01
+
+    if "JPY" in symbol:
+        return 0.01
+
+    return 0.0001
+
+
+def price_decimals(symbol: str) -> int:
+    if "JPY" in symbol.upper():
+        return 3
+
+    if "XAU" in symbol.upper() or "GOLD" in symbol.upper():
+        return 2
+
+    return 5
+
+
+def fmt_price(value: float, symbol: str) -> str:
+    decimals = price_decimals(symbol)
+    return f"{value:.{decimals}f}"
+
+
+def calculate_pips(price1: float, price2: float, symbol: str) -> float:
+    size = pip_size(symbol)
+    return abs(price2 - price1) / size
 
 
 # =========================================================
 # TWELVE DATA
 # =========================================================
 
-def get_market_data(symbol):
+def get_market_data(symbol: str, interval: str = "15min", outputsize: int = 200):
+    """
+    Gets OHLC data from Twelve Data.
+
+    For XAU/USD:
+        symbol = XAU/USD
+    For forex:
+        EUR/USD
+    For supported crypto:
+        BTC/USD etc.
+    """
+
     if not TWELVE_DATA_KEY:
-        return None, "TWELVE_DATA_KEY is missing"
+        raise RuntimeError("TWELVE_DATA_KEY is missing.")
 
-    now = time.time()
+    cache_key = f"{symbol}_{interval}"
 
-    # Check cache / cooldown
-    with cache_lock:
-        old = cache.get(symbol)
+    cached = DATA_CACHE.get(cache_key)
 
-        if old:
-            age = now - old["time"]
+    if cached:
+        age = (datetime.utcnow() - cached["time"]).total_seconds()
 
-            if age < REQUEST_COOLDOWN:
-                return old["data"], None
+        if age < CACHE_SECONDS:
+            return cached["data"].copy()
 
     url = "https://api.twelvedata.com/time_series"
 
     params = {
         "symbol": symbol,
-        "interval": TIMEFRAME,
-        "outputsize": 100,
-        "apikey": TWELVE_DATA_KEY
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_KEY,
+        "format": "JSON",
     }
 
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            timeout=20
+    response = requests.get(
+        url,
+        params=params,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "values" not in data:
+        raise RuntimeError(
+            data.get("message", "No market data returned.")
         )
 
-        if response.status_code == 429:
-            return None, (
-                "Twelve Data API limit reached. "
-                "Please wait before trying again."
-            )
+    df = pd.DataFrame(data["values"])
 
-        if response.status_code != 200:
-            return None, (
-                f"Twelve Data HTTP error: "
-                f"{response.status_code}"
-            )
+    numeric_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]
 
-        data = response.json()
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
 
-        if data.get("status") == "error":
-            return None, data.get(
-                "message",
-                "Twelve Data returned an error."
-            )
+    df["datetime"] = pd.to_datetime(
+        df["datetime"],
+        errors="coerce",
+    )
 
-        values = data.get("values")
+    df = df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+    )
 
-        if not values:
-            return None, "No market data returned."
+    df = df.sort_values("datetime").reset_index(drop=True)
 
-        # Twelve Data normally returns newest first.
-        values = list(reversed(values))
+    DATA_CACHE[cache_key] = {
+        "time": datetime.utcnow(),
+        "data": df.copy(),
+    }
 
-        with cache_lock:
-            cache[symbol] = {
-                "time": now,
-                "data": values
-            }
-
-        return values, None
-
-    except requests.RequestException as exc:
-        return None, f"Market request failed: {exc}"
+    return df
 
 
 # =========================================================
-# TECHNICAL ANALYSIS
+# INDICATORS
 # =========================================================
 
-def sma(values, period):
-    if len(values) < period:
-        return None
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
-    return sum(values[-period:]) / period
+    df = df.copy()
+
+    # EMA
+    df["EMA20"] = df["close"].ewm(
+        span=20,
+        adjust=False
+    ).mean()
+
+    df["EMA50"] = df["close"].ewm(
+        span=50,
+        adjust=False
+    ).mean()
+
+    df["EMA200"] = df["close"].ewm(
+        span=200,
+        adjust=False
+    ).mean()
+
+    # RSI
+    delta = df["close"].diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / avg_loss.replace(0, math.nan)
+
+    df["RSI"] = 100 - (
+        100 / (1 + rs)
+    )
+
+    # MACD
+    ema12 = df["close"].ewm(
+        span=12,
+        adjust=False
+    ).mean()
+
+    ema26 = df["close"].ewm(
+        span=26,
+        adjust=False
+    ).mean()
+
+    df["MACD"] = ema12 - ema26
+
+    df["MACD_SIGNAL"] = df["MACD"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    df["MACD_HIST"] = (
+        df["MACD"] -
+        df["MACD_SIGNAL"]
+    )
+
+    # ATR
+    previous_close = df["close"].shift(1)
+
+    tr1 = df["high"] - df["low"]
+
+    tr2 = (
+        df["high"] -
+        previous_close
+    ).abs()
+
+    tr3 = (
+        df["low"] -
+        previous_close
+    ).abs()
+
+    tr = pd.concat(
+        [tr1, tr2, tr3],
+        axis=1
+    ).max(axis=1)
+
+    df["ATR"] = tr.rolling(14).mean()
+
+    return df
 
 
-def calculate_ema(values, period):
-    if len(values) < period:
-        return None
+# =========================================================
+# SUPPORT / RESISTANCE
+# =========================================================
 
-    multiplier = 2 / (period + 1)
+def support_resistance(df: pd.DataFrame):
 
-    ema_value = sum(values[:period]) / period
+    recent = df.tail(50)
 
-    for price in values[period:]:
-        ema_value = (
-            (price - ema_value) * multiplier
-        ) + ema_value
+    support = float(
+        recent["low"].min()
+    )
 
-    return ema_value
+    resistance = float(
+        recent["high"].max()
+    )
 
-
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i - 1]
-
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = (
-            (avg_gain * (period - 1)) +
-            gains[i]
-        ) / period
-
-        avg_loss = (
-            (avg_loss * (period - 1)) +
-            losses[i]
-        ) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-
-    return 100 - (100 / (1 + rs))
+    return support, resistance
 
 
-def analyze_symbol(symbol):
-    values, error = get_market_data(symbol)
+# =========================================================
+# MARKET STRUCTURE
+# =========================================================
 
-    if error:
-        return {
-            "symbol": symbol,
-            "error": error
-        }
+def market_structure(df: pd.DataFrame):
 
-    try:
-        closes = [
-            float(x["close"])
-            for x in values
-        ]
+    recent = df.tail(20)
 
-        highs = [
-            float(x["high"])
-            for x in values
-        ]
+    highs = recent["high"].values
+    lows = recent["low"].values
 
-        lows = [
-            float(x["low"])
-            for x in values
-        ]
+    if len(highs) < 6:
+        return "UNKNOWN"
 
-        current = closes[-1]
+    last_high = highs[-1]
+    previous_high = highs[-4]
 
-        ema20 = calculate_ema(closes, 20)
-        ema50 = calculate_ema(closes, 50)
-        rsi = calculate_rsi(closes, 14)
+    last_low = lows[-1]
+    previous_low = lows[-4]
 
-        high20 = max(highs[-20:])
-        low20 = min(lows[-20:])
+    if (
+        last_high > previous_high
+        and last_low > previous_low
+    ):
+        return "HH / HL"
 
-        score = 0
+    if (
+        last_high < previous_high
+        and last_low < previous_low
+    ):
+        return "LH / LL"
 
-        # Trend
-        if ema20 is not None and ema50 is not None:
-            if ema20 > ema50:
-                score += 2
-            elif ema20 < ema50:
-                score -= 2
+    return "RANGE"
 
-        # Price vs EMA20
-        if ema20 is not None:
-            if current > ema20:
-                score += 1
-            elif current < ema20:
-                score -= 1
 
-        # RSI
-        if rsi is not None:
-            if 50 <= rsi <= 70:
-                score += 1
-            elif 30 <= rsi < 50:
-                score -= 1
+# =========================================================
+# CANDLESTICK ANALYSIS
+# =========================================================
 
-        # Avoid extreme RSI
-        if rsi is not None:
-            if rsi > 75:
-                score -= 1
-            elif rsi < 25:
-                score += 1
+def candle_analysis(df: pd.DataFrame):
 
-        if score >= 3:
-            signal = "BUY"
-        elif score <= -3:
-            signal = "SELL"
-        else:
-            signal = "WAIT"
+    last = df.iloc[-1]
 
-        return {
-            "symbol": symbol,
-            "price": current,
-            "ema20": ema20,
-            "ema50": ema50,
-            "rsi": rsi,
-            "high20": high20,
-            "low20": low20,
-            "score": score,
-            "signal": signal
-        }
+    body = abs(
+        last["close"] -
+        last["open"]
+    )
 
-    except Exception as exc:
-        return {
-            "symbol": symbol,
-            "error": f"Analysis error: {exc}"
-        }
+    upper_wick = (
+        last["high"] -
+        max(last["open"], last["close"])
+    )
+
+    lower_wick = (
+        min(last["open"], last["close"]) -
+        last["low"]
+    )
+
+    if body == 0:
+        return "DOJI"
+
+    if (
+        lower_wick > body * 2
+        and last["close"] > last["open"]
+    ):
+        return "BULLISH REJECTION"
+
+    if (
+        upper_wick > body * 2
+        and last["close"] < last["open"]
+    ):
+        return "BEARISH REJECTION"
+
+    if last["close"] > last["open"]:
+        return "BULLISH CANDLE"
+
+    return "BEARISH CANDLE"
+
+
+# =========================================================
+# MARKET ANALYSIS
+# =========================================================
+
+def analyze_market(
+    df: pd.DataFrame,
+    symbol: str
+):
+
+    df = calculate_indicators(df)
+
+    last = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    price = float(last["close"])
+
+    ema20 = float(last["EMA20"])
+    ema50 = float(last["EMA50"])
+    ema200 = float(last["EMA200"])
+
+    rsi = float(last["RSI"])
+    macd = float(last["MACD"])
+    macd_signal = float(last["MACD_SIGNAL"])
+
+    atr = float(last["ATR"])
+
+    buy_score = 0
+    sell_score = 0
+
+    # -----------------------------------------------------
+    # EMA TREND
+    # -----------------------------------------------------
+
+    if ema20 > ema50:
+        buy_score += 20
+
+    if ema20 < ema50:
+        sell_score += 20
+
+    # -----------------------------------------------------
+    # EMA 200
+    # -----------------------------------------------------
+
+    if price > ema200:
+        buy_score += 15
+
+    elif price < ema200:
+        sell_score += 15
+
+    # -----------------------------------------------------
+    # PRICE VS EMA20
+    # -----------------------------------------------------
+
+    if price > ema20:
+        buy_score += 10
+
+    elif price < ema20:
+        sell_score += 10
+
+    # -----------------------------------------------------
+    # RSI
+    # -----------------------------------------------------
+
+    if 52 <= rsi <= 70:
+        buy_score += 15
+
+    elif 30 <= rsi <= 48:
+        sell_score += 15
+
+    # -----------------------------------------------------
+    # MACD
+    # -----------------------------------------------------
+
+    if macd > macd_signal:
+        buy_score += 15
+
+    elif macd < macd_signal:
+        sell_score += 15
+
+    # -----------------------------------------------------
+    # MOMENTUM
+    # -----------------------------------------------------
+
+    if price > float(previous["close"]):
+        buy_score += 10
+
+    elif price < float(previous["close"]):
+        sell_score += 10
+
+    # -----------------------------------------------------
+    # STRUCTURE
+    # -----------------------------------------------------
+
+    structure = market_structure(df)
+
+    if structure == "HH / HL":
+        buy_score += 15
+
+    elif structure == "LH / LL":
+        sell_score += 15
+
+    # -----------------------------------------------------
+    # DECISION
+    # -----------------------------------------------------
+
+    if buy_score > sell_score:
+        direction = "BUY"
+
+    elif sell_score > buy_score:
+        direction = "SELL"
+
+    else:
+        direction = "WAIT"
+
+    confidence = max(
+        buy_score,
+        sell_score
+    )
+
+    # Cap at 100
+    confidence = min(
+        confidence,
+        100
+    )
+
+    support, resistance = support_resistance(df)
+
+    candle = candle_analysis(df)
+
+    # -----------------------------------------------------
+    # ENTRY / SL / TP
+    # -----------------------------------------------------
+
+    # ATR based distance.
+    # Minimum target is 50 pips.
+    min_distance = (
+        MIN_TARGET_PIPS *
+        pip_size(symbol)
+    )
+
+    atr_distance = atr * 1.5
+
+    distance = max(
+        min_distance,
+        atr_distance
+    )
+
+    if direction == "BUY":
+
+        entry = price
+
+        sl = entry - distance
+
+        tp1 = entry + distance * 1.5
+
+        tp2 = entry + distance * 2.5
+
+        buy_limit = max(
+            support,
+            entry - distance * 0.35
+        )
+
+        sell_limit = None
+
+    elif direction == "SELL":
+
+        entry = price
+
+        sl = entry + distance
+
+        tp1 = entry - distance * 1.5
+
+        tp2 = entry - distance * 2.5
+
+        sell_limit = min(
+            resistance,
+            entry + distance * 0.35
+        )
+
+        buy_limit = None
+
+    else:
+
+        entry = price
+
+        sl = None
+        tp1 = None
+        tp2 = None
+
+        buy_limit = support
+        sell_limit = resistance
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "direction": direction,
+        "confidence": confidence,
+        "structure": structure,
+        "candle": candle,
+        "support": support,
+        "resistance": resistance,
+        "ema20": ema20,
+        "ema50": ema50,
+        "ema200": ema200,
+        "rsi": rsi,
+        "macd": macd,
+        "macd_signal": macd_signal,
+        "atr": atr,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "buy_limit": buy_limit,
+        "sell_limit": sell_limit,
+        "distance": distance,
+        "target_pips": distance / pip_size(symbol),
+    }
 
 
 # =========================================================
 # FORMAT TELEGRAM SIGNAL
 # =========================================================
 
-def format_result(result):
+def format_signal(result):
+
     symbol = result["symbol"]
 
-    if result.get("error"):
-        return (
-            f"⚠️ {symbol}\n\n"
-            f"Error:\n{result['error']}"
-        )
+    direction = result["direction"]
 
-    price = result["price"]
-    ema20 = result["ema20"]
-    ema50 = result["ema50"]
-    rsi = result["rsi"]
-    score = result["score"]
-    signal = result["signal"]
+    confidence = result["confidence"]
 
-    if signal == "BUY":
-        icon = "🟢"
-    elif signal == "SELL":
-        icon = "🔴"
-    else:
-        icon = "🟡"
+    emoji = {
+        "BUY": "🟢",
+        "SELL": "🔴",
+        "WAIT": "🟡",
+    }.get(direction, "🟡")
 
-    return (
-        f"{icon} {symbol} MARKET ANALYSIS\n\n"
-        f"Signal: {signal}\n"
-        f"Price: {price:.6f}\n"
-        f"EMA20: {ema20:.6f}\n"
-        f"EMA50: {ema50:.6f}\n"
-        f"RSI(14): {rsi:.2f}\n"
-        f"Score: {score}\n\n"
-        f"Timeframe: {TIMEFRAME}\n"
-        f"⚠️ Signal only — not a guaranteed trade."
-    )
-
-
-# =========================================================
-# COMMANDS
-# =========================================================
-
-def command_status(chat_id):
     text = (
-        "🤖 Crypto Market Bot\n\n"
-        "Status: ONLINE ✅\n"
-        f"Timeframe: {TIMEFRAME}\n"
-        f"Symbols: {', '.join(SYMBOLS)}\n\n"
-        "Commands:\n"
-        "/status - bot status\n"
-        "/analyze BTC/USD - analyze one symbol\n"
-        "/scan - scan configured symbols\n"
-        "/all - same as scan"
+        f"📊 *MARKET ANALYSIS*\n\n"
+        f"💱 Symbol: `{symbol}`\n"
+        f"{emoji} Signal: *{direction}*\n"
+        f"🎯 Confidence: *{confidence}%*\n\n"
     )
 
-    send_message(chat_id, text)
-
-
-def command_analyze(chat_id, symbol):
-    if not symbol:
-        send_message(
-            chat_id,
-            "Usage:\n/analyze BTC/USD"
-        )
-        return
-
-    result = analyze_symbol(symbol.upper())
-
-    send_message(
-        chat_id,
-        format_result(result)
+    text += (
+        f"📌 Market Structure: `{result['structure']}`\n"
+        f"🕯 Candle: `{result['candle']}`\n\n"
     )
 
+    text += (
+        f"📈 EMA20: `{fmt_price(result['ema20'], symbol)}`\n"
+        f"📈 EMA50: `{fmt_price(result['ema50'], symbol)}`\n"
+        f"📈 EMA200: `{fmt_price(result['ema200'], symbol)}`\n"
+        f"📊 RSI: `{result['rsi']:.1f}`\n"
+        f"📉 MACD: `{result['macd']:.5f}`\n\n"
+    )
 
-def command_scan(chat_id):
-    if not SYMBOLS:
-        send_message(
-            chat_id,
-            "No symbols configured."
-        )
-        return
+    text += (
+        f"🧱 Support: `{fmt_price(result['support'], symbol)}`\n"
+        f"🧱 Resistance: `{fmt_price(result['resistance'], symbol)}`\n\n"
+    )
 
-    # One request per configured symbol.
-    # Cached requests will not hit Twelve Data again.
-    results = []
-
-    for symbol in SYMBOLS:
-        results.append(
-            analyze_symbol(symbol)
-        )
-
-    text = "📊 MARKET SCAN\n\n"
-
-    for result in results:
-        if result.get("error"):
-            text += (
-                f"⚠️ {result['symbol']}: "
-                f"{result['error']}\n\n"
-            )
-            continue
+    if direction == "BUY":
 
         text += (
-            f"{result['symbol']}\n"
-            f"Signal: {result['signal']}\n"
-            f"Price: {result['price']:.6f}\n"
-            f"RSI: {result['rsi']:.2f}\n"
-            f"Score: {result['score']}\n\n"
+            f"🎯 Entry: `{fmt_price(result['entry'], symbol)}`\n"
+            f"🟢 Buy Limit: `{fmt_price(result['buy_limit'], symbol)}`\n"
+            f"🛑 Stop Loss: `{fmt_price(result['sl'], symbol)}`\n"
+            f"🎯 TP1: `{fmt_price(result['tp1'], symbol)}`\n"
+            f"🎯 TP2: `{fmt_price(result['tp2'], symbol)}`\n\n"
+        )
+
+    elif direction == "SELL":
+
+        text += (
+            f"🎯 Entry: `{fmt_price(result['entry'], symbol)}`\n"
+            f"🔴 Sell Limit: `{fmt_price(result['sell_limit'], symbol)}`\n"
+            f"🛑 Stop Loss: `{fmt_price(result['sl'], symbol)}`\n"
+            f"🎯 TP1: `{fmt_price(result['tp1'], symbol)}`\n"
+            f"🎯 TP2: `{fmt_price(result['tp2'], symbol)}`\n\n"
+        )
+
+    else:
+
+        text += (
+            f"🟡 Market: WAIT\n"
+            f"🟢 Buy Limit area: `{fmt_price(result['buy_limit'], symbol)}`\n"
+            f"🔴 Sell Limit area: `{fmt_price(result['sell_limit'], symbol)}`\n\n"
         )
 
     text += (
-        f"Timeframe: {TIMEFRAME}\n"
-        "⚠️ Analysis is not a guaranteed prediction."
+        f"📏 Estimated target distance: "
+        f"`{result['target_pips']:.0f} pips`\n\n"
     )
 
-    send_message(chat_id, text)
+    if confidence >= MIN_CONFIDENCE:
+
+        text += (
+            "🟢 *GOOD MARKET CONDITION*\n"
+            "Multiple indicators are aligned."
+        )
+
+    else:
+
+        text += (
+            "🟡 *WEAK / UNCERTAIN CONDITION*\n"
+            "Wait for stronger confirmation."
+        )
+
+    text += (
+        "\n\n⚠️ Educational market analysis only. "
+        "Always manage risk yourself."
+    )
+
+    return text
 
 
 # =========================================================
-# TELEGRAM WEBHOOK
+# TELEGRAM COMMANDS
 # =========================================================
 
-@app.post("/telegram/webhook")
-def telegram_webhook():
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    message = (
+        "🤖 *Crypto Flow Bot*\n\n"
+        "Send a symbol to analyze it.\n\n"
+        "Examples:\n"
+        "`XAUUSD`\n"
+        "`EUR/USD`\n"
+        "`GBP/USD`\n"
+        "`BTC/USD`\n"
+        "`ETH/USD`\n\n"
+        "You can also send a *chart screenshot* 📸 "
+        "for AI chart analysis."
+    )
+
+    await update.message.reply_text(
+        message,
+        parse_mode="Markdown"
+    )
+
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        "📚 *Commands*\n\n"
+        "/start - Start bot\n"
+        "/help - Help\n"
+        "/analyze XAUUSD - Analyze symbol\n\n"
+        "You can also simply type:\n"
+        "`XAUUSD`\n"
+        "`EUR/USD`\n"
+        "`BTC/USD`"
+    )
+
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown"
+    )
+
+
+# =========================================================
+# TEXT SYMBOL ANALYSIS
+# =========================================================
+
+async def analyze_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Example: `/analyze XAUUSD`",
+            parse_mode="Markdown"
+        )
+
+        return
+
+    symbol = normalize_symbol(
+        context.args[0]
+    )
+
+    await analyze_and_reply(
+        update,
+        symbol
+    )
+
+
+async def text_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    text = update.message.text.strip()
+
+    if not text:
+        return
+
+    # Only treat short text as symbol request.
+    if len(text) > 30:
+        return
+
+    symbol = normalize_symbol(text)
+
+    await analyze_and_reply(
+        update,
+        symbol
+    )
+
+
+async def analyze_and_reply(
+    update: Update,
+    symbol: str
+):
+
+    status = await update.message.reply_text(
+        f"🔎 Analyzing `{symbol}`...\n"
+        f"5M + 15M + 1H data loading...",
+        parse_mode="Markdown"
+    )
+
     try:
-        update = request.get_json(silent=True) or {}
 
-        message = update.get("message")
+        # Main timeframe
+        df15 = get_market_data(
+            symbol,
+            "15min",
+            200
+        )
 
-        if not message:
-            return jsonify({"ok": True})
+        result = analyze_market(
+            df15,
+            symbol
+        )
 
-        chat = message.get("chat", {})
-        chat_id = str(chat.get("id", ""))
+        # Higher timeframe confirmation
+        try:
 
-        text = message.get("text", "").strip()
-
-        if not text:
-            return jsonify({"ok": True})
-
-        parts = text.split()
-
-        command = parts[0].lower().split("@")[0]
-
-        if command == "/start":
-            command_status(chat_id)
-
-        elif command == "/status":
-            command_status(chat_id)
-
-        elif command == "/analyze":
-            symbol = parts[1] if len(parts) > 1 else ""
-            command_analyze(chat_id, symbol)
-
-        elif command in ("/scan", "/all"):
-            command_scan(chat_id)
-
-        else:
-            send_message(
-                chat_id,
-                "Unknown command.\n\n"
-                "Use /status to see available commands."
+            df1h = get_market_data(
+                symbol,
+                "1h",
+                200
             )
 
-        return jsonify({"ok": True})
+            result_1h = analyze_market(
+                df1h,
+                symbol
+            )
 
-    except Exception as exc:
-        print("Webhook error:", exc)
+            # Add higher timeframe confirmation
+            if result["direction"] == result_1h["direction"]:
+                result["confidence"] = min(
+                    100,
+                    result["confidence"] + 10
+                )
 
-        return jsonify({
-            "ok": False,
-            "error": str(exc)
-        }), 500
+            else:
+                result["confidence"] = max(
+                    0,
+                    result["confidence"] - 10
+                )
+
+        except Exception as e:
+
+            logger.warning(
+                "1H analysis failed: %s",
+                e
+            )
+
+        text = format_signal(
+            result
+        )
+
+        await status.edit_text(
+            text,
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Analysis error"
+        )
+
+        await status.edit_text(
+            "❌ *Analysis failed*\n\n"
+            f"Reason: `{str(e)[:500]}`\n\n"
+            "Check your Twelve Data API key "
+            "and symbol format.",
+            parse_mode="Markdown"
+        )
 
 
 # =========================================================
-# SET TELEGRAM WEBHOOK
+# GROQ CHART SCREENSHOT ANALYSIS
 # =========================================================
 
-def set_webhook():
-    render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+def groq_analyze_image(
+    image_bytes: bytes,
+    symbol_hint: str = ""
+):
 
-    if not render_url:
-        print("RENDER_EXTERNAL_URL is not available.")
-        return
+    if not GROQ_API_KEY:
 
-    if not TELEGRAM_BOT_TOKEN:
-        print("TELEGRAM_BOT_TOKEN is missing.")
-        return
+        return (
+            "❌ GROQ_API_KEY is not configured."
+        )
 
-    webhook_url = (
-        render_url.rstrip("/")
-        + "/telegram/webhook"
+    client = Groq(
+        api_key=GROQ_API_KEY
     )
 
-    result = telegram_api(
-        "setWebhook",
-        {
-            "url": webhook_url
-        }
+    import base64
+
+    encoded = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
+
+    prompt = f"""
+You are a technical chart-analysis assistant.
+
+Analyze this trading chart screenshot.
+
+Symbol hint:
+{symbol_hint or "unknown"}
+
+Return a concise analysis containing:
+
+1. Symbol/timeframe if visible
+2. Trend
+3. Market structure: HH/HL/LH/LL
+4. Support
+5. Resistance
+6. EMA 20/50/200 if visible
+7. RSI if visible
+8. MACD if visible
+9. Candlestick/breakout observation
+10. BUY / SELL / WAIT
+11. Possible entry area
+12. Stop loss area
+13. TP1
+14. TP2
+15. Confidence percentage
+
+Do not invent values that are not visible.
+If exact prices cannot be read, clearly say that.
+
+This is educational technical analysis, not guaranteed financial advice.
+"""
+
+    completion = client.chat.completions.create(
+        model="qwen/qwen3.6-27b",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": (
+                                "data:image/jpeg;base64,"
+                                + encoded
+                            )
+                        },
+                    },
+                ],
+            }
+        ],
+        temperature=0.2,
+        max_completion_tokens=1500,
     )
 
-    print("Telegram webhook:", result)
+    return completion.choices[0].message.content
+
+
+async def photo_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message.photo:
+        return
+
+    wait = await update.message.reply_text(
+        "📸 Chart received.\n"
+        "🤖 Groq AI is analyzing the chart..."
+    )
+
+    try:
+
+        photo = update.message.photo[-1]
+
+        file = await context.bot.get_file(
+            photo.file_id
+        )
+
+        buffer = io.BytesIO()
+
+        await file.download_to_memory(
+            buffer
+        )
+
+        image_bytes = buffer.getvalue()
+
+        caption = (
+            update.message.caption
+            or ""
+        )
+
+        result = groq_analyze_image(
+            image_bytes,
+            caption
+        )
+
+        await wait.edit_text(
+            "📊 *AI CHART ANALYSIS*\n\n"
+            + result
+            + "\n\n⚠️ Educational analysis only.",
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Image analysis error"
+        )
+
+        await wait.edit_text(
+            "❌ Chart analysis failed.\n\n"
+            f"`{str(e)[:500]}`",
+            parse_mode="Markdown"
+        )
 
 
 # =========================================================
-# STARTUP
+# TELEGRAM ERROR
 # =========================================================
 
-if __name__ == "__main__":
-    print("======================================")
-    print("Crypto Market Bot starting...")
-    print("======================================")
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    if not TELEGRAM_BOT_TOKEN:
-        print("WARNING: TELEGRAM_BOT_TOKEN missing")
+    logger.error(
+        "Telegram error: %s",
+        context.error
+    )
 
-    if not TELEGRAM_CHAT_ID:
-        print("WARNING: TELEGRAM_CHAT_ID missing")
 
-    if not TWELVE_DATA_KEY:
-        print("WARNING: TWELVE_DATA_KEY missing")
+# =========================================================
+# RENDER WEB SERVER
+# =========================================================
 
-    print("Symbols:", SYMBOLS)
-    print("Timeframe:", TIMEFRAME)
-
-    # Give Render a moment to provide its external URL.
-    threading.Thread(
-        target=set_webhook,
-        daemon=True
-    ).start()
-
-    port = int(os.getenv("PORT", "10000"))
+def run_flask():
 
     app.run(
         host="0.0.0.0",
-        port=port
+        port=PORT,
+        use_reloader=False
     )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing."
+        )
+
+    if not TWELVE_DATA_KEY:
+        logger.warning(
+            "TWELVE_DATA_KEY is missing. "
+            "Market analysis will not work."
+        )
+
+    if not GROQ_API_KEY:
+        logger.warning(
+            "GROQ_API_KEY is missing. "
+            "Screenshot analysis will not work."
+        )
+
+    # Render health server
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True
+    )
+
+    flask_thread.start()
+
+    # Telegram application
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "help",
+            help_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "analyze",
+            analyze_command
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            text_message
+        )
+    )
+
+    application.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "Crypto Flow Bot starting..."
+    )
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
+
+
+if __name__ == "__main__":
+    main()
