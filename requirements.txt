@@ -1,7 +1,5 @@
-python-telegram-bot
-requests
-pandas
-Pillow
-Flask
-groq
-google-genai
+python-telegram-bot==22.8
+requests==2.34.0
+pandas==2.3.3
+groq==1.7.0
+google-genai==2.4.0
