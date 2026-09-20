@@ -1,15 +1,8 @@
-# ============================================================
-# ETHIO TRADE BOT
-# Telegram + Twelve Data + Groq Vision + Gemini Vision
-# Render Ready
-# ============================================================
-
 import os
+import json
+import base64
 import asyncio
 import threading
-import traceback
-import base64
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
@@ -19,53 +12,38 @@ from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-
-# ============================================================
+# =========================================================
 # CONFIG
-# ============================================================
+# =========================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY", "").strip()
+TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 PORT = int(os.getenv("PORT", "10000"))
 
-# Groq models are tried in this order.
-# The code automatically falls back if the first model
-# is not available for your API key.
-GROQ_VISION_MODELS = [
-    os.getenv("GROQ_VISION_MODEL", "").strip(),
-    "qwen/qwen3.8-27b",
-    "qwen/qwen3.6-27b",
-]
-
-# Remove duplicates / empty values
-GROQ_VISION_MODELS = list(
-    dict.fromkeys(
-        model for model in GROQ_VISION_MODELS
-        if model
-    )
+GROQ_MODEL = os.getenv(
+    "GROQ_VISION_MODEL",
+    "qwen/qwen3.8-27b"
 )
 
-# Current stable Gemini Flash model
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.6-flash"
-).strip()
+)
 
-
-# ============================================================
+# =========================================================
 # SYMBOLS
-# ============================================================
+# =========================================================
 
 SYMBOLS = [
     "BTC/USD",
@@ -78,7 +56,12 @@ SYMBOLS = [
     "AVAX/USD",
     "LINK/USD",
     "TRX/USD",
+    "XAU/USD",
 ]
+
+# =========================================================
+# TIMEFRAMES
+# =========================================================
 
 TIMEFRAMES = [
     "1min",
@@ -95,19 +78,43 @@ TIMEFRAMES = [
     "1month",
 ]
 
+# =========================================================
+# PIP SIZE
+# =========================================================
 
-# ============================================================
+PIP_SIZE = {
+    "XAU/USD": 0.01,
+
+    "BTC/USD": 0.01,
+    "ETH/USD": 0.01,
+    "BNB/USD": 0.01,
+    "SOL/USD": 0.01,
+    "AVAX/USD": 0.01,
+    "LINK/USD": 0.01,
+
+    "XRP/USD": 0.0001,
+    "DOGE/USD": 0.0001,
+    "ADA/USD": 0.0001,
+    "TRX/USD": 0.0001,
+}
+
+MIN_PIPS = 50
+
+# =========================================================
 # RENDER HEALTH SERVER
-# ============================================================
+# =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "text/plain"
+        )
         self.end_headers()
         self.wfile.write(
-            b"ETHIO TRADE BOT is running"
+            b"ETHIO TRADE BOT OK"
         )
 
     def log_message(self, format, *args):
@@ -115,84 +122,110 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server():
-    try:
-        server = ThreadingHTTPServer(
-            ("0.0.0.0", PORT),
-            HealthHandler
-        )
 
-        print(
-            f"Health server listening on "
-            f"0.0.0.0:{PORT}"
-        )
-
-        thread = threading.Thread(
-            target=server.serve_forever,
-            daemon=True
-        )
-
-        thread.start()
-
-    except Exception:
-        print("Health server error:")
-        traceback.print_exc()
-
-
-# ============================================================
-# STARTUP DIAGNOSTICS
-# ============================================================
-
-def print_startup_status():
-
-    print("")
-    print("=" * 60)
-    print("STARTING ETHIO TRADE BOT")
-    print("=" * 60)
-
-    print(
-        "TELEGRAM_BOT_TOKEN:",
-        "OK" if TELEGRAM_BOT_TOKEN else "MISSING"
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
     )
 
     print(
-        "TWELVE_DATA_KEY:",
-        "OK" if TWELVE_DATA_KEY else "MISSING"
+        f"Health server running on port {PORT}"
     )
 
-    print(
-        "GROQ_API_KEY:",
-        "OK" if GROQ_API_KEY else "MISSING"
+    server.serve_forever()
+
+
+# =========================================================
+# NORMALIZE SYMBOL
+# =========================================================
+
+def normalize_symbol(symbol):
+
+    symbol = symbol.strip().upper()
+
+    aliases = {
+        "BTCUSD": "BTC/USD",
+        "ETHUSD": "ETH/USD",
+        "BNBUSD": "BNB/USD",
+        "SOLUSD": "SOL/USD",
+        "XRPUSD": "XRP/USD",
+        "DOGEUSD": "DOGE/USD",
+        "ADAUSD": "ADA/USD",
+        "AVAXUSD": "AVAX/USD",
+        "LINKUSD": "LINK/USD",
+        "TRXUSD": "TRX/USD",
+        "XAUUSD": "XAU/USD",
+    }
+
+    return aliases.get(symbol, symbol)
+
+
+# =========================================================
+# NORMALIZE TIMEFRAME
+# =========================================================
+
+def normalize_timeframe(timeframe):
+
+    timeframe = timeframe.strip().lower()
+
+    aliases = {
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "45m": "45min",
+
+        "1h": "1h",
+        "2h": "2h",
+        "4h": "4h",
+        "8h": "8h",
+
+        "d": "1day",
+        "1d": "1day",
+
+        "w": "1week",
+        "1w": "1week",
+
+        "mo": "1month",
+        "1mo": "1month",
+    }
+
+    return aliases.get(
+        timeframe,
+        timeframe
     )
 
-    print(
-        "GEMINI_API_KEY:",
-        "OK" if GEMINI_API_KEY else "MISSING"
-    )
 
-    print(
-        "GROQ MODELS:",
-        ", ".join(GROQ_VISION_MODELS)
-    )
+# =========================================================
+# VALIDATION
+# =========================================================
 
-    print(
-        "GEMINI MODEL:",
-        GEMINI_MODEL
-    )
-
-    print("=" * 60)
-    print("")
+def valid_symbol(symbol):
+    return symbol in SYMBOLS
 
 
-# ============================================================
+def valid_timeframe(timeframe):
+    return timeframe in TIMEFRAMES
+
+
+# =========================================================
 # TWELVE DATA
-# ============================================================
+# =========================================================
 
-def get_market_data(symbol, interval="5min", outputsize=100):
+def get_market_data(
+    symbol,
+    interval="30min",
+    outputsize=100
+):
 
     if not TWELVE_DATA_KEY:
-        return None
+        raise Exception(
+            "TWELVE_DATA_KEY is missing"
+        )
 
-    url = "https://api.twelvedata.com/time_series"
+    url = (
+        "https://api.twelvedata.com/time_series"
+    )
 
     params = {
         "symbol": symbol,
@@ -202,118 +235,107 @@ def get_market_data(symbol, interval="5min", outputsize=100):
         "format": "JSON",
     }
 
-    try:
+    response = requests.get(
+        url,
+        params=params,
+        timeout=30
+    )
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=20
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "values" not in data:
+
+        raise Exception(
+            data.get(
+                "message",
+                "No market data returned"
+            )
         )
 
-        if response.status_code != 200:
-            print(
-                "Twelve Data HTTP:",
-                response.status_code
-            )
-            return None
+    df = pd.DataFrame(
+        data["values"]
+    )
 
-        data = response.json()
-
-        if "values" not in data:
-            print(
-                "Twelve Data error:",
-                data.get("message", data)
-            )
-            return None
-
-        df = pd.DataFrame(data["values"])
-
-        if df.empty:
-            return None
-
-        for column in [
-            "open",
-            "high",
-            "low",
-            "close"
-        ]:
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce"
-            )
-
-        df = df.sort_values("datetime")
-        df = df.reset_index(drop=True)
-
-        return df
-
-    except Exception as e:
-
-        print(
-            "Twelve Data exception:",
-            str(e)
+    if df.empty:
+        raise Exception(
+            "Empty market data"
         )
 
-        return None
+    df["datetime"] = pd.to_datetime(
+        df["datetime"]
+    )
 
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close"
+    ]:
 
-# ============================================================
-# INDICATORS
-# ============================================================
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
 
-def calculate_indicators(df):
+    df = df.sort_values(
+        "datetime"
+    ).reset_index(drop=True)
 
-    if df is None or len(df) < 30:
-        return None
-
-    df = df.copy()
-
+    # =====================================================
     # EMA
-    df["EMA9"] = (
-        df["close"]
-        .ewm(span=9, adjust=False)
-        .mean()
-    )
+    # =====================================================
 
-    df["EMA21"] = (
-        df["close"]
-        .ewm(span=21, adjust=False)
-        .mean()
-    )
+    df["EMA9"] = df["close"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
 
+    df["EMA21"] = df["close"].ewm(
+        span=21,
+        adjust=False
+    ).mean()
+
+    # =====================================================
     # RSI
+    # =====================================================
+
     delta = df["close"].diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = (
-        gain
-        .rolling(
-            window=14,
-            min_periods=14
-        )
-        .mean()
+    gain = delta.clip(
+        lower=0
     )
 
-    avg_loss = (
-        loss
-        .rolling(
-            window=14,
-            min_periods=14
-        )
-        .mean()
+    loss = -delta.clip(
+        upper=0
     )
 
-    avg_loss = avg_loss.replace(0, float("nan"))
+    avg_gain = gain.rolling(
+        14
+    ).mean()
 
-    rs = avg_gain / avg_loss
+    avg_loss = loss.rolling(
+        14
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(
+        0,
+        pd.NA
+    )
 
     df["RSI14"] = (
-        100 - (100 / (1 + rs))
+        100 -
+        (
+            100 /
+            (1 + rs)
+        )
     )
 
-    # Support / Resistance
+    # =====================================================
+    # SUPPORT / RESISTANCE
+    # =====================================================
+
     df["HIGH20"] = (
         df["high"]
         .rolling(20)
@@ -326,14 +348,32 @@ def calculate_indicators(df):
         .min()
     )
 
+    df = df.dropna(
+        subset=[
+            "EMA9",
+            "EMA21",
+            "RSI14",
+            "HIGH20",
+            "LOW20"
+        ]
+    )
+
+    if df.empty:
+        raise Exception(
+            "Not enough market data"
+        )
+
     return df
 
 
-# ============================================================
-# MARKET ANALYSIS
-# ============================================================
+# =========================================================
+# TECHNICAL ANALYSIS
+# =========================================================
 
-def analyze_market(symbol, timeframe):
+def technical_analysis(
+    symbol,
+    timeframe
+):
 
     df = get_market_data(
         symbol,
@@ -341,338 +381,221 @@ def analyze_market(symbol, timeframe):
         100
     )
 
-    if df is None:
-        return (
-            f"❌ NO DATA\n"
-            f"Symbol: {symbol}\n"
-            f"Timeframe: {timeframe}"
-        )
-
-    df = calculate_indicators(df)
-
-    if df is None:
-        return (
-            f"❌ Not enough market data\n"
-            f"Symbol: {symbol}\n"
-            f"Timeframe: {timeframe}"
-        )
-
     last = df.iloc[-1]
 
-    close = float(last["close"])
+    price = float(last["close"])
     ema9 = float(last["EMA9"])
     ema21 = float(last["EMA21"])
-    rsi = float(last["RSI14"]) if pd.notna(last["RSI14"]) else 50
-    high20 = float(last["HIGH20"])
-    low20 = float(last["LOW20"])
+    rsi = float(last["RSI14"])
 
-    score = 0
+    support = float(last["LOW20"])
+    resistance = float(last["HIGH20"])
 
-    # EMA
-    if ema9 > ema21:
-        score += 1
-    elif ema9 < ema21:
-        score -= 1
+    # =====================================================
+    # SIGNAL
+    # =====================================================
 
-    # RSI
-    if rsi < 35:
-        score += 1
-    elif rsi > 65:
-        score -= 1
+    if (
+        ema9 > ema21
+        and 52 <= rsi <= 70
+    ):
 
-    # Price position
-    if close > high20 * 0.995:
-        score += 1
-
-    if close < low20 * 1.005:
-        score -= 1
-
-    if score >= 2:
         signal = "BUY"
 
-    elif score <= -2:
+        confidence = 70
+
+        if ema9 > ema21:
+            confidence += 5
+
+        if 55 <= rsi <= 65:
+            confidence += 5
+
+    elif (
+        ema9 < ema21
+        and 30 <= rsi <= 48
+    ):
+
         signal = "SELL"
 
+        confidence = 70
+
+        if ema9 < ema21:
+            confidence += 5
+
+        if 35 <= rsi <= 45:
+            confidence += 5
+
     else:
+
         signal = "WAIT"
 
+        confidence = 55
+
+    confidence = min(
+        confidence,
+        95
+    )
+
+    # =====================================================
+    # PIP DISTANCE
+    # =====================================================
+
+    pip = PIP_SIZE.get(
+        symbol,
+        0.01
+    )
+
+    min_distance = (
+        MIN_PIPS * pip
+    )
+
+    # =====================================================
+    # LEVELS
+    # =====================================================
+
+    if signal == "BUY":
+
+        entry = price
+
+        tp = max(
+            price + min_distance,
+            resistance
+        )
+
+        sl = min(
+            price - min_distance,
+            support
+        )
+
+        buy_limit = price - min_distance
+
+        sell_limit = max(
+            price + min_distance,
+            resistance
+        )
+
+    elif signal == "SELL":
+
+        entry = price
+
+        tp = min(
+            price - min_distance,
+            support
+        )
+
+        sl = max(
+            price + min_distance,
+            resistance
+        )
+
+        sell_limit = price + min_distance
+
+        buy_limit = min(
+            price - min_distance,
+            support
+        )
+
+    else:
+
+        entry = price
+
+        tp = price + min_distance
+
+        sl = price - min_distance
+
+        buy_limit = price - min_distance
+
+        sell_limit = price + min_distance
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "signal": signal,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "buy_limit": buy_limit,
+        "sell_limit": sell_limit,
+        "confidence": confidence,
+        "price": price,
+        "ema9": ema9,
+        "ema21": ema21,
+        "rsi": rsi,
+        "support": support,
+        "resistance": resistance,
+    }
+
+
+# =========================================================
+# FORMAT NUMBER
+# =========================================================
+
+def format_price(value):
+
+    try:
+
+        value = float(value)
+
+        if abs(value) >= 1000:
+            return f"{value:.2f}"
+
+        if abs(value) >= 1:
+            return f"{value:.4f}".rstrip("0").rstrip(".")
+
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+
+    except Exception:
+
+        return str(value)
+
+
+# =========================================================
+# FORMAT TECHNICAL RESULT
+# =========================================================
+
+def format_technical_result(result):
+
+    signal = result["signal"]
+
+    if signal == "BUY":
+        emoji = "🟢"
+
+    elif signal == "SELL":
+        emoji = "🔴"
+
+    else:
+        emoji = "⚪"
+
     return (
-        f"📊 MARKET ANALYSIS\n\n"
-        f"Symbol: {symbol}\n"
-        f"Timeframe: {timeframe}\n\n"
-        f"💰 Price: {close:.5f}\n"
-        f"📈 EMA9: {ema9:.5f}\n"
-        f"📉 EMA21: {ema21:.5f}\n"
-        f"RSI14: {rsi:.2f}\n\n"
-        f"🔺 Resistance: {high20:.5f}\n"
-        f"🔻 Support: {low20:.5f}\n\n"
-        f"🎯 Signal: {signal}\n"
-        f"Score: {score}\n\n"
-        f"⚠️ Educational analysis only."
+        f"📊 {result['symbol']} | "
+        f"{result['timeframe']}\n\n"
+
+        f"🤖 BOT: {emoji} {signal}\n"
+        f"🔥 Confidence: "
+        f"{result['confidence']}%\n\n"
+
+        f"🟢 Entry: "
+        f"{format_price(result['entry'])}\n"
+
+        f"🎯 TP: "
+        f"{format_price(result['tp'])}\n"
+
+        f"🛑 SL: "
+        f"{format_price(result['sl'])}\n\n"
+
+        f"🟢 BUY LIMIT: "
+        f"{format_price(result['buy_limit'])}\n"
+
+        f"🔴 SELL LIMIT: "
+        f"{format_price(result['sell_limit'])}"
     )
 
 
-# ============================================================
-# VALIDATION
-# ============================================================
-
-def valid_symbol(symbol):
-
-    return symbol.upper() in [
-        s.upper() for s in SYMBOLS
-    ]
-
-
-def valid_timeframe(timeframe):
-
-    return timeframe in TIMEFRAMES
-
-
-# ============================================================
-# /START
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    text = (
-        "🤖 ETHIO TRADE BOT\n\n"
-        "Welcome!\n\n"
-
-        "📊 Commands:\n"
-        "/symbols - Show symbols\n"
-        "/timeframes - Show timeframes\n"
-        "/analyze BTC/USD 5min\n"
-        "/scan BTC/USD 15min\n"
-        "/all\n"
-        "/ping\n\n"
-
-        "📷 Send a chart screenshot "
-        "for AI analysis."
-    )
-
-    await update.message.reply_text(text)
-
-
-# ============================================================
-# /PING
-# ============================================================
-
-async def ping_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "🟢 ETHIO TRADE BOT is online."
-    )
-
-
-# ============================================================
-# /SYMBOLS
-# ============================================================
-
-async def symbols_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    text = "📊 AVAILABLE SYMBOLS\n\n"
-
-    for symbol in SYMBOLS:
-        text += f"• {symbol}\n"
-
-    await update.message.reply_text(text)
-
-
-# ============================================================
-# /TIMEFRAMES
-# ============================================================
-
-async def timeframes_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    text = "⏱ AVAILABLE TIMEFRAMES\n\n"
-
-    for timeframe in TIMEFRAMES:
-        text += f"• {timeframe}\n"
-
-    await update.message.reply_text(text)
-
-
-# ============================================================
-# /ANALYZE
-# ============================================================
-
-async def analyze_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            "❌ Usage:\n\n"
-            "/analyze BTC/USD 5min"
-        )
-
-        return
-
-    symbol = context.args[0].upper()
-    timeframe = context.args[1]
-
-    if not valid_symbol(symbol):
-
-        await update.message.reply_text(
-            "❌ Invalid symbol.\n\n"
-            "Use /symbols"
-        )
-
-        return
-
-    if not valid_timeframe(timeframe):
-
-        await update.message.reply_text(
-            "❌ Invalid timeframe.\n\n"
-            "Use /timeframes"
-        )
-
-        return
-
-    await update.message.reply_text(
-        "⏳ Analyzing..."
-    )
-
-    result = await asyncio.to_thread(
-        analyze_market,
-        symbol,
-        timeframe
-    )
-
-    await update.message.reply_text(
-        result
-    )
-
-
-# ============================================================
-# /SCAN
-# ============================================================
-
-async def scan_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if len(context.args) < 2:
-
-        await update.message.reply_text(
-            "❌ Usage:\n\n"
-            "/scan BTC/USD 15min"
-        )
-
-        return
-
-    symbol = context.args[0].upper()
-    timeframe = context.args[1]
-
-    if not valid_symbol(symbol):
-
-        await update.message.reply_text(
-            "❌ Invalid symbol."
-        )
-
-        return
-
-    if not valid_timeframe(timeframe):
-
-        await update.message.reply_text(
-            "❌ Invalid timeframe."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "🔎 Scanning market..."
-    )
-
-    result = await asyncio.to_thread(
-        analyze_market,
-        symbol,
-        timeframe
-    )
-
-    await update.message.reply_text(
-        result
-    )
-
-
-# ============================================================
-# /ALL
-# ============================================================
-
-async def all_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "🚀 Starting full market scan...\n\n"
-        "This may take some time because "
-        "multiple API requests are required."
-    )
-
-    results = []
-
-    for symbol in SYMBOLS:
-
-        for timeframe in TIMEFRAMES:
-
-            result = await asyncio.to_thread(
-                analyze_market,
-                symbol,
-                timeframe
-            )
-
-            results.append(
-                f"{symbol} | {timeframe}\n"
-                f"{result}\n"
-            )
-
-            # Avoid hammering the API
-            await asyncio.sleep(0.15)
-
-    # Telegram message size protection
-    chunk = ""
-    chunks = []
-
-    for result in results:
-
-        if len(chunk) + len(result) > 3800:
-
-            chunks.append(chunk)
-            chunk = ""
-
-        chunk += result + "\n"
-
-    if chunk:
-        chunks.append(chunk)
-
-    for part in chunks:
-
-        await update.message.reply_text(
-            part
-        )
-
-
-# ============================================================
+# =========================================================
 # GROQ MODEL DISCOVERY
-# ============================================================
+# =========================================================
 
-def get_groq_available_models():
+def get_groq_models():
 
     if not GROQ_API_KEY:
         return []
@@ -683,9 +606,7 @@ def get_groq_available_models():
 
     headers = {
         "Authorization":
-            f"Bearer {GROQ_API_KEY}",
-        "Content-Type":
-            "application/json",
+        f"Bearer {GROQ_API_KEY}"
     }
 
     try:
@@ -693,697 +614,1236 @@ def get_groq_available_models():
         response = requests.get(
             url,
             headers=headers,
-            timeout=15
+            timeout=20
         )
 
-        if response.status_code != 200:
-
-            print(
-                "Groq models HTTP:",
-                response.status_code
-            )
-
-            return []
+        response.raise_for_status()
 
         data = response.json()
 
-        models = []
-
-        for item in data.get("data", []):
-
-            model_id = item.get("id")
-
-            if model_id:
-                models.append(model_id)
-
-        return models
+        return [
+            item.get("id")
+            for item in data.get("data", [])
+            if item.get("id")
+        ]
 
     except Exception as e:
 
         print(
             "Groq model discovery error:",
-            str(e)
+            e
         )
 
         return []
 
 
-# ============================================================
-# GROQ PHOTO SCAN
-# ============================================================
+# =========================================================
+# IMAGE BASE64
+# =========================================================
 
-def groq_photo_scan(image_bytes):
+def image_to_base64(
+    image_path
+):
+
+    with open(
+        image_path,
+        "rb"
+    ) as file:
+
+        return base64.b64encode(
+            file.read()
+        ).decode("utf-8")
+
+
+# =========================================================
+# CLEAN JSON
+# =========================================================
+
+def clean_json(text):
+
+    text = text.strip()
+
+    if text.startswith("```"):
+
+        text = text.replace(
+            "```json",
+            ""
+        )
+
+        text = text.replace(
+            "```",
+            ""
+        )
+
+        text = text.strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start >= 0 and end >= 0:
+
+        text = text[
+            start:end + 1
+        ]
+
+    return text
+
+
+# =========================================================
+# TRADING PROMPT
+# =========================================================
+
+def trading_prompt():
+
+    return """
+Analyze the trading chart carefully.
+
+Return ONLY valid JSON.
+NO markdown.
+NO explanation.
+NO extra text.
+
+Use exactly these fields:
+
+{
+  "symbol": "XAUUSD",
+  "timeframe": "M30",
+  "signal": "BUY",
+  "entry": "4375",
+  "tp": "4395",
+  "sl": "4365",
+  "buy_limit": "4368",
+  "sell_limit": "4400",
+  "confidence": "82%",
+  "reason": "short reason"
+}
+
+Rules:
+
+signal must be BUY, SELL, or WAIT.
+
+If BUY:
+- entry should be realistic
+- tp must be above entry
+- sl must be below entry
+- buy_limit must be below entry
+- sell_limit must be above entry
+
+If SELL:
+- entry should be realistic
+- tp must be below entry
+- sl must be above entry
+- sell_limit must be above entry
+- buy_limit must be below entry
+
+If WAIT:
+- still provide reasonable levels
+- confidence should represent setup strength
+
+Confidence must be between 0% and 100%.
+
+Do not guarantee profit.
+Do not invent certainty.
+
+Keep reason under 8 words.
+"""
+
+
+# =========================================================
+# GROQ PHOTO ANALYSIS
+# =========================================================
+
+def groq_photo_analysis(
+    image_path
+):
 
     if not GROQ_API_KEY:
 
-        return (
-            "❌ Groq error\n\n"
-            "GROQ_API_KEY is missing "
-            "in Render Environment Variables."
-        )
+        return {
+            "error":
+            "GROQ_API_KEY missing"
+        }
 
-    image_b64 = base64.b64encode(
-        image_bytes
-    ).decode("utf-8")
+    image_b64 = image_to_base64(
+        image_path
+    )
 
     url = (
-        "https://api.groq.com/openai/v1/"
-        "chat/completions"
+        "https://api.groq.com/openai/"
+        "v1/chat/completions"
     )
 
     headers = {
         "Authorization":
-            f"Bearer {GROQ_API_KEY}",
+        f"Bearer {GROQ_API_KEY}",
+
         "Content-Type":
-            "application/json",
+        "application/json",
     }
 
-    prompt = """
-Analyze this trading chart screenshot.
+    payload = {
 
-Return a concise technical analysis.
+        "model": GROQ_MODEL,
 
-Identify if visible:
-- Symbol
-- Timeframe
-- Current price
-- Trend
-- Support
-- Resistance
-- EMA
-- RSI
-- Candlestick structure
-- BUY / SELL / WAIT setup
+        "messages": [
 
-Important:
-Do not invent values that are not visible.
-If an indicator is not visible, say "Not visible".
+            {
+                "role": "system",
+                "content":
+                trading_prompt()
+            },
 
-For the setup:
-Use BUY, SELL, or WAIT based only on the visible chart structure.
+            {
+                "role": "user",
 
-Include:
-1. Symbol
-2. Timeframe
-3. Current trend
-4. Support
-5. Resistance
-6. Candlestick structure
-7. EMA
-8. RSI
-9. Setup
-10. Reasons
-11. Risk warning
+                "content": [
 
-This is educational technical analysis,
-not financial advice.
-"""
+                    {
+                        "type": "text",
+                        "text":
+                        "Analyze this chart."
+                    },
 
-    # --------------------------------------------------------
-    # First use models configured above.
-    # Then discover active models if necessary.
-    # --------------------------------------------------------
+                    {
+                        "type": "image_url",
 
-    models_to_try = list(GROQ_VISION_MODELS)
+                        "image_url": {
+                            "url":
+                            (
+                                "data:image/jpeg;base64,"
+                                f"{image_b64}"
+                            )
+                        }
+                    }
 
-    available_models = get_groq_available_models()
+                ]
+            }
 
-    # Prefer known vision models if account exposes them
-    for model in [
-        "qwen/qwen3.8-27b",
-        "qwen/qwen3.6-27b",
-    ]:
+        ],
 
-        if model in available_models:
-            if model not in models_to_try:
-                models_to_try.append(model)
+        "temperature": 0.1,
 
-    # --------------------------------------------------------
-    # Try each model
-    # --------------------------------------------------------
+        "max_tokens": 300
+    }
 
-    errors = []
-
-    for model in models_to_try:
-
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url":
-                                    "data:image/jpeg;base64,"
-                                    + image_b64
-                            },
-                        },
-                    ],
-                }
-            ],
-            "temperature": 0.2,
-            "max_tokens": 1800,
-        }
-
-        try:
-
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=90
-            )
-
-            # Success
-            if response.status_code == 200:
-
-                data = response.json()
-
-                choices = data.get(
-                    "choices",
-                    []
-                )
-
-                if choices:
-
-                    message = choices[0].get(
-                        "message",
-                        {}
-                    )
-
-                    content = message.get(
-                        "content"
-                    )
-
-                    if content:
-
-                        return (
-                            "👁️ GROQ PHOTO SCAN\n\n"
-                            f"Model: {model}\n\n"
-                            f"{content}"
-                        )
-
-                errors.append(
-                    f"{model}: empty response"
-                )
-
-                continue
-
-            # Model not found/access
-            if response.status_code == 404:
-
-                errors.append(
-                    f"{model}: model not available"
-                )
-
-                continue
-
-            # Other API error
-            try:
-                error_data = response.json()
-            except Exception:
-                error_data = response.text
-
-            errors.append(
-                f"{model}: HTTP "
-                f"{response.status_code} - "
-                f"{error_data}"
-            )
-
-        except Exception as e:
-
-            errors.append(
-                f"{model}: {str(e)}"
-            )
-
-    # --------------------------------------------------------
-    # Nothing worked
-    # --------------------------------------------------------
-
-    return (
-        "👁️ GROQ PHOTO SCAN\n\n"
-        "❌ Groq could not access a Vision model.\n\n"
-        "Models tried:\n"
-        + "\n".join(
-            f"• {x}" for x in models_to_try
-        )
-        + "\n\n"
-        "Details:\n"
-        + "\n".join(
-            f"• {x}" for x in errors
-        )
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=120
     )
 
+    response.raise_for_status()
 
-# ============================================================
-# GEMINI PHOTO SCAN
-# ============================================================
+    data = response.json()
 
-def gemini_photo_scan(image_bytes):
+    text = (
+        data["choices"][0]
+        ["message"]["content"]
+    )
+
+    try:
+
+        return json.loads(
+            clean_json(text)
+        )
+
+    except Exception:
+
+        return {
+            "error":
+            "Groq returned invalid JSON",
+            "raw": text
+        }
+
+
+# =========================================================
+# GEMINI PHOTO ANALYSIS
+# =========================================================
+
+def gemini_photo_analysis(
+    image_path
+):
 
     if not GEMINI_API_KEY:
 
-        return (
-            "✨ GEMINI PHOTO SCAN\n\n"
-            "❌ GEMINI_API_KEY is missing "
-            "in Render Environment Variables."
-        )
+        return {
+            "error":
+            "GEMINI_API_KEY missing"
+        }
 
-    image_b64 = base64.b64encode(
-        image_bytes
-    ).decode("utf-8")
+    image_b64 = image_to_base64(
+        image_path
+    )
 
     url = (
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{GEMINI_MODEL}:generateContent"
+        f"?key={GEMINI_API_KEY}"
     )
 
-    params = {
-        "key": GEMINI_API_KEY
-    }
-
-    headers = {
-        "Content-Type":
-            "application/json"
-    }
-
-    prompt = """
-Analyze this trading chart screenshot carefully.
-
-Give a concise technical analysis.
-
-Identify:
-1. Symbol
-2. Timeframe
-3. Current trend
-4. Current price if visible
-5. Support
-6. Resistance
-7. Candlestick structure
-8. EMA if visible
-9. RSI if visible
-10. BUY / SELL / WAIT setup
-11. Main technical reasons
-12. Risk warning
-
-Do NOT invent information.
-If something is not visible, say "Not visible".
-
-If the chart says market closed,
-mention that.
-
-Use only the visible chart information.
-
-This is educational technical analysis,
-not financial advice or a guarantee.
-"""
-
     payload = {
+
         "contents": [
+
             {
                 "parts": [
+
                     {
-                        "text": prompt
+                        "text":
+                        trading_prompt()
                     },
+
                     {
                         "inline_data": {
+
                             "mime_type":
-                                "image/jpeg",
+                            "image/jpeg",
+
                             "data":
-                                image_b64
+                            image_b64
                         }
                     }
+
                 ]
             }
-        ]
+
+        ],
+
+        "generationConfig": {
+
+            "temperature": 0.1,
+
+            "maxOutputTokens": 300,
+
+            "responseMimeType":
+            "application/json"
+        }
     }
+
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=120
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    text = (
+        data["candidates"][0]
+        ["content"]["parts"][0]["text"]
+    )
 
     try:
 
-        response = requests.post(
-            url,
-            params=params,
-            headers=headers,
-            json=payload,
-            timeout=90
+        return json.loads(
+            clean_json(text)
         )
 
-        if response.status_code != 200:
+    except Exception:
 
-            try:
-                error_data = response.json()
-            except Exception:
-                error_data = response.text
+        return {
+            "error":
+            "Gemini returned invalid JSON",
+            "raw": text
+        }
 
-            return (
-                "✨ GEMINI PHOTO SCAN\n\n"
-                f"❌ Gemini error\n\n"
-                f"HTTP: {response.status_code}\n"
-                f"Model: {GEMINI_MODEL}\n\n"
-                f"{error_data}"
-            )
 
-        data = response.json()
+# =========================================================
+# GET VALUE
+# =========================================================
 
-        candidates = data.get(
-            "candidates",
-            []
+def get_value(
+    data,
+    key
+):
+
+    if not isinstance(
+        data,
+        dict
+    ):
+        return "-"
+
+    value = data.get(
+        key,
+        "-"
+    )
+
+    if value is None:
+        return "-"
+
+    return str(value)
+
+
+# =========================================================
+# FINAL SIGNAL
+# =========================================================
+
+def final_signal(
+    bot,
+    groq,
+    gemini
+):
+
+    signals = []
+
+    for data in [
+        bot,
+        groq,
+        gemini
+    ]:
+
+        if not isinstance(
+            data,
+            dict
+        ):
+            continue
+
+        signal = data.get(
+            "signal"
         )
 
-        if not candidates:
+        if signal in [
+            "BUY",
+            "SELL",
+            "WAIT"
+        ]:
 
-            return (
-                "✨ GEMINI PHOTO SCAN\n\n"
-                "❌ Gemini returned no candidates."
+            signals.append(
+                signal
             )
 
-        parts = (
-            candidates[0]
-            .get("content", {})
-            .get("parts", [])
+    if not signals:
+        return "WAIT"
+
+    buys = signals.count(
+        "BUY"
+    )
+
+    sells = signals.count(
+        "SELL"
+    )
+
+    if buys >= 2:
+        return "BUY"
+
+    if sells >= 2:
+        return "SELL"
+
+    return "WAIT"
+
+
+# =========================================================
+# FINAL CONFIDENCE
+# =========================================================
+
+def extract_confidence(data):
+
+    try:
+
+        value = str(
+            data.get(
+                "confidence",
+                "0"
+            )
         )
 
-        text_parts = []
+        value = (
+            value
+            .replace("%", "")
+            .strip()
+        )
 
-        for part in parts:
+        return float(value)
 
-            text = part.get("text")
+    except Exception:
 
-            if text:
-                text_parts.append(text)
+        return 0
 
-        if not text_parts:
 
-            return (
-                "✨ GEMINI PHOTO SCAN\n\n"
-                "❌ Gemini returned empty text."
+def calculate_confidence(
+    bot,
+    groq,
+    gemini
+):
+
+    values = []
+
+    for data in [
+        bot,
+        groq,
+        gemini
+    ]:
+
+        if isinstance(
+            data,
+            dict
+        ):
+
+            values.append(
+                extract_confidence(
+                    data
+                )
             )
 
-        return (
-            "✨ GEMINI PHOTO SCAN\n\n"
-            + "\n".join(text_parts)
+    if not values:
+        return 0
+
+    return round(
+        sum(values) / len(values)
+    )
+
+
+# =========================================================
+# COMBINED PHOTO OUTPUT
+# =========================================================
+
+def combined_output(
+    bot,
+    groq,
+    gemini
+):
+
+    final = final_signal(
+        bot,
+        groq,
+        gemini
+    )
+
+    confidence = calculate_confidence(
+        bot,
+        groq,
+        gemini
+    )
+
+    # =====================================================
+    # SELECT LEVELS
+    # =====================================================
+
+    source = None
+
+    if final == "BUY":
+
+        for data in [
+            bot,
+            groq,
+            gemini
+        ]:
+
+            if (
+                isinstance(data, dict)
+                and data.get("signal")
+                == "BUY"
+            ):
+
+                source = data
+                break
+
+    elif final == "SELL":
+
+        for data in [
+            bot,
+            groq,
+            gemini
+        ]:
+
+            if (
+                isinstance(data, dict)
+                and data.get("signal")
+                == "SELL"
+            ):
+
+                source = data
+                break
+
+    if source is None:
+
+        for data in [
+            bot,
+            groq,
+            gemini
+        ]:
+
+            if isinstance(
+                data,
+                dict
+            ):
+
+                source = data
+                break
+
+    if source is None:
+        source = {}
+
+    symbol = (
+        get_value(
+            bot,
+            "symbol"
+        )
+    )
+
+    timeframe = (
+        get_value(
+            bot,
+            "timeframe"
+        )
+    )
+
+    return (
+        f"📊 {symbol} | "
+        f"{timeframe}\n\n"
+
+        f"🤖 BOT: "
+        f"{get_value(bot, 'signal')}\n"
+
+        f"👁️ GROQ: "
+        f"{get_value(groq, 'signal')}\n"
+
+        f"✨ GEMINI: "
+        f"{get_value(gemini, 'signal')}\n\n"
+
+        f"🎯 FINAL: {final}\n"
+        f"🔥 Confidence: "
+        f"{confidence}%\n\n"
+
+        f"🟢 Entry: "
+        f"{get_value(source, 'entry')}\n"
+
+        f"🎯 TP: "
+        f"{get_value(source, 'tp')}\n"
+
+        f"🛑 SL: "
+        f"{get_value(source, 'sl')}\n\n"
+
+        f"🟢 BUY LIMIT: "
+        f"{get_value(source, 'buy_limit')}\n"
+
+        f"🔴 SELL LIMIT: "
+        f"{get_value(source, 'sell_limit')}"
+    )
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        "🤖 ETHIO TRADE BOT\n\n"
+
+        "Use:\n"
+        "/analyze BTC/USD 5min\n"
+        "/analyze XAU/USD 30min\n\n"
+
+        "/scan BTC/USD\n\n"
+
+        "📸 Send a chart screenshot "
+        "for BOT + GROQ + GEMINI analysis."
+    )
+
+    await update.message.reply_text(
+        text
+    )
+
+
+# =========================================================
+# /PING
+# =========================================================
+
+async def ping_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    await update.message.reply_text(
+        "🟢 BOT ONLINE"
+    )
+
+
+# =========================================================
+# /SYMBOLS
+# =========================================================
+
+async def symbols_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        "📊 Available Symbols:\n\n"
+        + "\n".join(
+            f"• {symbol}"
+            for symbol in SYMBOLS
+        )
+    )
+
+    await update.message.reply_text(
+        text
+    )
+
+
+# =========================================================
+# /TIMEFRAMES
+# =========================================================
+
+async def timeframes_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        "⏱ Available Timeframes:\n\n"
+        + "\n".join(
+            f"• {tf}"
+            for tf in TIMEFRAMES
+        )
+    )
+
+    await update.message.reply_text(
+        text
+    )
+
+
+# =========================================================
+# /ANALYZE
+# =========================================================
+
+async def analyze_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if len(context.args) < 2:
+
+        await update.message.reply_text(
+            "❌ Use:\n"
+            "/analyze BTC/USD 5min"
+        )
+
+        return
+
+    symbol = normalize_symbol(
+        context.args[0]
+    )
+
+    timeframe = normalize_timeframe(
+        context.args[1]
+    )
+
+    if not valid_symbol(symbol):
+
+        await update.message.reply_text(
+            "❌ Invalid symbol.\n\n"
+            "Use /symbols"
+        )
+
+        return
+
+    if not valid_timeframe(
+        timeframe
+    ):
+
+        await update.message.reply_text(
+            "❌ Invalid timeframe.\n\n"
+            "Use /timeframes"
+        )
+
+        return
+
+    message = await update.message.reply_text(
+        f"⏳ Analyzing {symbol} | "
+        f"{timeframe}..."
+    )
+
+    try:
+
+        result = await asyncio.to_thread(
+            technical_analysis,
+            symbol,
+            timeframe
+        )
+
+        output = format_technical_result(
+            result
+        )
+
+        await message.edit_text(
+            output
         )
 
     except Exception as e:
 
-        return (
-            "✨ GEMINI PHOTO SCAN\n\n"
-            "❌ Gemini exception\n\n"
+        await message.edit_text(
+            "❌ Analysis error:\n"
             f"{str(e)}"
         )
 
 
-# ============================================================
+# =========================================================
+# /SCAN SYMBOL
+# =========================================================
+
+async def scan_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if len(context.args) < 1:
+
+        await update.message.reply_text(
+            "❌ Use:\n"
+            "/scan BTC/USD"
+        )
+
+        return
+
+    symbol = normalize_symbol(
+        context.args[0]
+    )
+
+    if not valid_symbol(symbol):
+
+        await update.message.reply_text(
+            "❌ Invalid symbol.\n\n"
+            "Use /symbols"
+        )
+
+        return
+
+    status = await update.message.reply_text(
+        f"⏳ Scanning {symbol}..."
+    )
+
+    results = []
+
+    for timeframe in TIMEFRAMES:
+
+        try:
+
+            result = await asyncio.to_thread(
+                technical_analysis,
+                symbol,
+                timeframe
+            )
+
+            signal = result["signal"]
+
+            if signal == "BUY":
+                emoji = "🟢"
+
+            elif signal == "SELL":
+                emoji = "🔴"
+
+            else:
+                emoji = "⚪"
+
+            results.append(
+                f"{emoji} {timeframe} | "
+                f"{signal} | "
+                f"{result['confidence']}%"
+            )
+
+        except Exception as e:
+
+            results.append(
+                f"⚠️ {timeframe} | ERROR"
+            )
+
+    output = (
+        f"📊 {symbol} SCAN\n\n"
+        + "\n".join(results)
+    )
+
+    await status.edit_text(
+        output
+    )
+
+
+# =========================================================
 # PHOTO HANDLER
-# ============================================================
+# =========================================================
 
 async def photo_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.message:
-        return
+    photo = update.message.photo[-1]
 
-    if not update.message.photo:
-        return
+    file = await photo.get_file()
 
-    await update.message.reply_text(
-        "📷 Image received.\n\n"
-        "⏳ Running Groq + Gemini analysis..."
+    image_path = "/tmp/chart.jpg"
+
+    await file.download_to_drive(
+        image_path
+    )
+
+    status = await update.message.reply_text(
+        "🔎 Analyzing chart...\n"
+        "🤖 BOT + GROQ + GEMINI"
     )
 
     try:
 
-        photo = update.message.photo[-1]
+        # =================================================
+        # AI IMAGE ANALYSIS
+        # =================================================
 
-        file = await photo.get_file()
-
-        image_bytes = (
-            await file.download_as_bytearray()
-        )
-
-        image_bytes = bytes(image_bytes)
-
-        # Run both AI scans simultaneously
         groq_task = asyncio.to_thread(
-            groq_photo_scan,
-            image_bytes
+            groq_photo_analysis,
+            image_path
         )
 
         gemini_task = asyncio.to_thread(
-            gemini_photo_scan,
-            image_bytes
+            gemini_photo_analysis,
+            image_path
         )
 
-        groq_result, gemini_result = (
-            await asyncio.gather(
-                groq_task,
-                gemini_task
+        groq, gemini = await asyncio.gather(
+            groq_task,
+            gemini_task
+        )
+
+        # =================================================
+        # BOT ANALYSIS
+        # =================================================
+
+        # Default screenshot technical analysis.
+        # AI models identify the chart symbol/timeframe.
+
+        bot = None
+
+        detected_symbol = None
+        detected_timeframe = None
+
+        for data in [
+            groq,
+            gemini
+        ]:
+
+            if isinstance(
+                data,
+                dict
+            ):
+
+                detected_symbol = data.get(
+                    "symbol"
+                )
+
+                detected_timeframe = data.get(
+                    "timeframe"
+                )
+
+                if (
+                    detected_symbol
+                    and detected_timeframe
+                ):
+                    break
+
+        if detected_symbol:
+
+            detected_symbol = normalize_symbol(
+                detected_symbol
             )
+
+        timeframe_map = {
+            "M1": "1min",
+            "M5": "5min",
+            "M15": "15min",
+            "M30": "30min",
+            "M45": "45min",
+            "H1": "1h",
+            "H2": "2h",
+            "H4": "4h",
+            "H8": "8h",
+            "D1": "1day",
+            "W1": "1week",
+            "MN1": "1month",
+            "1M": "1month",
+        }
+
+        if detected_timeframe:
+
+            detected_timeframe = (
+                detected_timeframe
+                .upper()
+                .strip()
+            )
+
+            detected_timeframe = (
+                timeframe_map.get(
+                    detected_timeframe,
+                    detected_timeframe.lower()
+                )
+            )
+
+        # =================================================
+        # RUN BOT ONLY FOR DETECTED SYMBOL/TIMEFRAME
+        # =================================================
+
+        if (
+            detected_symbol
+            in SYMBOLS
+            and
+            detected_timeframe
+            in TIMEFRAMES
+        ):
+
+            try:
+
+                bot = await asyncio.to_thread(
+                    technical_analysis,
+                    detected_symbol,
+                    detected_timeframe
+                )
+
+            except Exception as e:
+
+                bot = {
+                    "symbol":
+                    detected_symbol,
+
+                    "timeframe":
+                    detected_timeframe,
+
+                    "signal":
+                    "WAIT",
+
+                    "confidence":
+                    "0",
+
+                    "error":
+                    str(e)
+                }
+
+        else:
+
+            bot = {
+                "symbol":
+                get_value(
+                    groq,
+                    "symbol"
+                ),
+
+                "timeframe":
+                get_value(
+                    groq,
+                    "timeframe"
+                ),
+
+                "signal":
+                "WAIT",
+
+                "confidence":
+                "0"
+            }
+
+        # =================================================
+        # OUTPUT
+        # =================================================
+
+        output = combined_output(
+            bot,
+            groq,
+            gemini
         )
 
-        # Send Groq result
-        await update.message.reply_text(
-            groq_result
-        )
-
-        # Send Gemini result
-        await update.message.reply_text(
-            gemini_result
-        )
-
-        # Risk note
-        await update.message.reply_text(
-            "⚠️ RISK WARNING\n\n"
-            "Chart analysis is educational only. "
-            "Markets can move unexpectedly. "
-            "Do not risk money you cannot afford to lose."
+        await status.edit_text(
+            output
         )
 
     except Exception as e:
 
-        print("Photo handler error:")
-        traceback.print_exc()
-
-        await update.message.reply_text(
-            "❌ Photo processing error:\n\n"
+        await status.edit_text(
+            "❌ Photo analysis error:\n"
             f"{str(e)}"
         )
 
+    finally:
 
-# ============================================================
+        try:
+
+            if os.path.exists(
+                image_path
+            ):
+
+                os.remove(
+                    image_path
+                )
+
+        except Exception:
+            pass
+
+
+# =========================================================
 # TEXT HANDLER
-# ============================================================
+# =========================================================
 
 async def text_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.message:
-        return
+    text = update.message.text.strip()
 
-    text = update.message.text
-
-    if not text:
+    if text.startswith("/"):
         return
 
     await update.message.reply_text(
-        "🤖 I received your message.\n\n"
-        "Use:\n"
-        "/start\n"
-        "/symbols\n"
-        "/timeframes\n"
+        "🤖 Use:\n\n"
         "/analyze BTC/USD 5min\n"
-        "/scan BTC/USD 15min\n\n"
-        "Or send a chart screenshot 📷"
+        "/scan BTC/USD\n"
+        "/symbols\n"
+        "/timeframes\n\n"
+        "📸 Or send a chart screenshot."
     )
 
 
-# ============================================================
+# =========================================================
 # ERROR HANDLER
-# ============================================================
+# =========================================================
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    print("Telegram error:")
-
-    try:
-        print(context.error)
-        traceback.print_exception(
-            type(context.error),
-            context.error,
-            context.error.__traceback__
-        )
-
-    except Exception:
-        print("Unknown Telegram error")
+    print(
+        "Telegram error:",
+        context.error
+    )
 
 
-# ============================================================
+# =========================================================
 # MAIN
-# ============================================================
+# =========================================================
 
 def main():
 
-    try:
+    if not TELEGRAM_BOT_TOKEN:
 
-        print_startup_status()
-
-        # ----------------------------------------------------
-        # Telegram token is REQUIRED
-        # ----------------------------------------------------
-
-        if not TELEGRAM_BOT_TOKEN:
-
-            raise RuntimeError(
-                "TELEGRAM_BOT_TOKEN is missing. "
-                "Add it to Render Environment Variables."
-            )
-
-        # ----------------------------------------------------
-        # Start Render health server
-        # ----------------------------------------------------
-
-        start_health_server()
-
-        # ----------------------------------------------------
-        # Build Telegram application
-        # ----------------------------------------------------
-
-        application = (
-            Application
-            .builder()
-            .token(TELEGRAM_BOT_TOKEN)
-            .build()
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing"
         )
 
-        # ----------------------------------------------------
-        # Commands
-        # ----------------------------------------------------
+    # =====================================================
+    # START RENDER HEALTH SERVER
+    # =====================================================
 
-        application.add_handler(
-            CommandHandler(
-                "start",
-                start_command
-            )
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True
+    )
+
+    health_thread.start()
+
+    # =====================================================
+    # TELEGRAM APP
+    # =====================================================
+
+    application = (
+        Application.builder()
+        .token(
+            TELEGRAM_BOT_TOKEN
         )
+        .build()
+    )
 
-        application.add_handler(
-            CommandHandler(
-                "ping",
-                ping_command
-            )
+    # =====================================================
+    # COMMANDS
+    # =====================================================
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command
         )
+    )
 
-        application.add_handler(
-            CommandHandler(
-                "symbols",
-                symbols_command
-            )
+    application.add_handler(
+        CommandHandler(
+            "ping",
+            ping_command
         )
+    )
 
-        application.add_handler(
-            CommandHandler(
-                "timeframes",
-                timeframes_command
-            )
+    application.add_handler(
+        CommandHandler(
+            "symbols",
+            symbols_command
         )
+    )
 
-        application.add_handler(
-            CommandHandler(
-                "analyze",
-                analyze_command
-            )
+    application.add_handler(
+        CommandHandler(
+            "timeframes",
+            timeframes_command
         )
+    )
 
-        application.add_handler(
-            CommandHandler(
-                "scan",
-                scan_command
-            )
+    application.add_handler(
+        CommandHandler(
+            "analyze",
+            analyze_command
         )
+    )
 
-        application.add_handler(
-            CommandHandler(
-                "all",
-                all_command
-            )
+    application.add_handler(
+        CommandHandler(
+            "scan",
+            scan_command
         )
+    )
 
-        # ----------------------------------------------------
-        # Photo
-        # ----------------------------------------------------
+    # =====================================================
+    # PHOTO
+    # =====================================================
 
-        application.add_handler(
-            MessageHandler(
-                filters.PHOTO,
-                photo_handler
-            )
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler
         )
+    )
 
-        # ----------------------------------------------------
-        # Text
-        # ----------------------------------------------------
+    # =====================================================
+    # TEXT
+    # =====================================================
 
-        application.add_handler(
-            MessageHandler(
-                filters.TEXT
-                & ~filters.COMMAND,
-                text_handler
-            )
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT
+            & ~filters.COMMAND,
+            text_handler
         )
+    )
 
-        # ----------------------------------------------------
-        # Error handler
-        # ----------------------------------------------------
+    # =====================================================
+    # ERROR
+    # =====================================================
 
-        application.add_error_handler(
-            error_handler
-        )
+    application.add_error_handler(
+        error_handler
+    )
 
-        print("")
-        print("=" * 60)
-        print("TELEGRAM BOT IS RUNNING")
-        print("=" * 60)
-        print("")
+    print(
+        "ETHIO TRADE BOT STARTED"
+    )
 
-        # ----------------------------------------------------
-        # Start polling
-        # ----------------------------------------------------
-
-        application.run_polling(
-            drop_pending_updates=True
-        )
-
-    except Exception:
-
-        print("")
-        print("=" * 60)
-        print("FATAL ERROR")
-        print("=" * 60)
-
-        traceback.print_exc()
-
-        print("=" * 60)
-        print("")
-
-        raise
+    application.run_polling(
+        drop_pending_updates=True
+    )
 
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
     main()
