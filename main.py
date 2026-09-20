@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
@@ -31,15 +32,19 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
 GROQ_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-
-# IMPORTANT:
-# A signal is accepted only when TP is at least 101 pips
-# away from entry in the signal direction.
-MIN_PIPS = 101
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODELS = [
+    GEMINI_MODEL,
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+]
 
 # Minimum confidence for a technical BUY/SELL signal.
 MIN_CONFIDENCE = 80
+
+# Internal target-distance filter. This is intentionally NOT shown to users.
+INTERNAL_MIN_TARGET_PIPS = 101
 
 # A BUY/SELL is published only when at least 2 of the 3
 # analysis sources agree and the averaged confidence reaches this level.
@@ -178,10 +183,6 @@ def get_pip_size(symbol):
     return 0.01
 
 
-def min_price_distance(symbol):
-    return MIN_PIPS * get_pip_size(symbol)
-
-
 # =========================================================
 # RENDER HEALTH SERVER
 # =========================================================
@@ -284,6 +285,20 @@ def get_market_data(symbol, interval="30min", outputsize=150):
 # TECHNICAL ANALYSIS
 # =========================================================
 
+def target_distance_pips(symbol, entry, target):
+    try:
+        pip_size = float(get_pip_size(symbol))
+        if pip_size <= 0:
+            return 0.0
+        return abs(float(target) - float(entry)) / pip_size
+    except Exception:
+        return 0.0
+
+
+def target_meets_minimum(symbol, entry, target):
+    return target_distance_pips(symbol, entry, target) >= INTERNAL_MIN_TARGET_PIPS
+
+
 def technical_analysis(symbol, timeframe):
     df = get_market_data(symbol, timeframe, 150)
     last = df.iloc[-1]
@@ -324,66 +339,41 @@ def technical_analysis(symbol, timeframe):
 
     confidence = min(confidence, 95)
 
-    distance = min_price_distance(symbol)
-
-    # Require enough room for 101+ pips.
-    # We use at least 101 pips and also avoid placing TP inside
-    # a very small ATR environment.
-    target_distance = max(distance, atr * 1.5)
+    # Use live market structure and ATR to derive levels.
+    # There is no fixed pip target restriction.
+    target_distance = max(atr * 1.5, get_pip_size(symbol))
 
     if signal == "BUY":
         entry = price
-
-        tp = max(
-            price + distance,
-            resistance + get_pip_size(symbol)
-        )
-
-        # Never allow TP below the minimum distance.
-        if tp - entry < distance:
-            tp = entry + distance
-
-        sl = min(
-            price - distance,
-            support
-        )
-
-        buy_limit = price - distance
-        sell_limit = max(price + distance, resistance)
+        tp = resistance if resistance > price else price + target_distance
+        sl = support if support < price else price - target_distance
+        buy_limit = support if support < price else price - target_distance
+        sell_limit = resistance if resistance > price else price + target_distance
 
     elif signal == "SELL":
         entry = price
-
-        tp = min(
-            price - distance,
-            support - get_pip_size(symbol)
-        )
-
-        # Never allow TP below the minimum distance.
-        if entry - tp < distance:
-            tp = entry - distance
-
-        sl = max(
-            price + distance,
-            resistance
-        )
-
-        sell_limit = price + distance
-        buy_limit = min(price - distance, support)
+        tp = support if support < price else price - target_distance
+        sl = resistance if resistance > price else price + target_distance
+        sell_limit = resistance if resistance > price else price + target_distance
+        buy_limit = support if support < price else price - target_distance
 
     else:
         entry = price
-        tp = price + distance
-        sl = price - distance
-        buy_limit = price - distance
-        sell_limit = price + distance
+        tp = price + target_distance
+        sl = price - target_distance
+        buy_limit = price - target_distance
+        sell_limit = price + target_distance
 
-    # Final hard safety check: BUY/SELL TP must be >= 101 pips.
-    if signal == "BUY" and (tp - entry) < distance:
-        signal = "WAIT"
-
-    if signal == "SELL" and (entry - tp) < distance:
-        signal = "WAIT"
+    # Only publish a directional signal when the live market-structure
+    # target is at least the internal minimum distance. Do not force a
+    # larger TP just to satisfy the filter; use WAIT when the market
+    # does not support the required target.
+    pip_size = get_pip_size(symbol)
+    if signal in ("BUY", "SELL") and pip_size:
+        target_pips = abs(float(tp) - float(entry)) / float(pip_size)
+        if target_pips < INTERNAL_MIN_TARGET_PIPS:
+            signal = "WAIT"
+            confidence = min(confidence, 55)
 
     return {
         "symbol": symbol,
@@ -402,7 +392,6 @@ def technical_analysis(symbol, timeframe):
         "atr": atr,
         "support": support,
         "resistance": resistance,
-        "min_pips": MIN_PIPS,
         "pip_size": get_pip_size(symbol),
     }
 
@@ -440,7 +429,6 @@ def format_technical_result(result):
         f"📊 {result['symbol']} | {result['timeframe']}\n\n"
         f"🤖 BOT: {emoji} {signal}\n"
         f"🔥 Confidence: {result['confidence']}%\n"
-        f"📏 Minimum target: {MIN_PIPS} pips+\n\n"
         f"🟢 Entry: {format_price(result['entry'])}\n"
         f"🎯 TP: {format_price(result['tp'])}\n"
         f"🛑 SL: {format_price(result['sl'])}\n\n"
@@ -501,10 +489,9 @@ Use exactly these fields:
 Rules:
 - signal must be BUY, SELL, or WAIT.
 - Confidence must be 0% to 100%.
-- The bot requires a minimum target of {MIN_PIPS} pips.
-- If BUY, TP MUST be at least {MIN_PIPS} pips above entry.
-- If SELL, TP MUST be at least {MIN_PIPS} pips below entry.
-- If the chart does not provide enough room for {MIN_PIPS} pips, use WAIT.
+- Set TP from the live market structure and visible target area.
+- Do not force a fixed pip distance.
+- If the chart does not support a clear target, use WAIT.
 - BUY: SL below entry.
 - SELL: SL above entry.
 - Do not guarantee profit.
@@ -565,16 +552,18 @@ def groq_photo_analysis(image_path):
 
 
 def gemini_photo_analysis(image_path):
+    """Analyze a chart with Gemini, with retry/fallback protection.
+
+    A temporary Gemini 503 must NOT stop the whole Telegram photo analysis.
+    """
     if not GEMINI_API_KEY:
-        return {"error": "GEMINI_API_KEY missing"}
+        return {
+            "signal": "WAIT",
+            "confidence": "0",
+            "error": "GEMINI_API_KEY missing",
+        }
 
     image_b64 = image_to_base64(image_path)
-
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{GEMINI_MODEL}:generateContent"
-        f"?key={GEMINI_API_KEY}"
-    )
 
     payload = {
         "contents": [
@@ -597,16 +586,79 @@ def gemini_photo_analysis(image_path):
         },
     }
 
-    response = requests.post(url, json=payload, timeout=120)
-    response.raise_for_status()
+    last_error = "Gemini unavailable"
 
-    data = response.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    # Google recommends exponential backoff for transient 503/429/5xx errors.
+    for model in GEMINI_FALLBACK_MODELS:
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            f"v1beta/models/{model}:generateContent"
+            f"?key={GEMINI_API_KEY}"
+        )
 
-    try:
-        return json.loads(clean_json(text))
-    except Exception:
-        return {"error": "Gemini returned invalid JSON", "raw": text}
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    url,
+                    json=payload,
+                    timeout=120,
+                )
+
+                # Retry transient server/rate-limit errors.
+                if response.status_code in (408, 429, 500, 502, 503, 504):
+                    last_error = (
+                        f"Gemini {model}: HTTP {response.status_code}"
+                    )
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                        continue
+                    break
+
+                response.raise_for_status()
+                data = response.json()
+
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    last_error = f"Gemini {model}: no candidates returned"
+                    break
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join(
+                    part.get("text", "")
+                    for part in parts
+                    if isinstance(part, dict)
+                ).strip()
+
+                if not text:
+                    last_error = f"Gemini {model}: empty response"
+                    break
+
+                try:
+                    result = json.loads(clean_json(text))
+                    if isinstance(result, dict):
+                        result["model"] = model
+                        return result
+                    last_error = f"Gemini {model}: invalid JSON object"
+                except Exception:
+                    last_error = f"Gemini {model}: invalid JSON"
+                    break
+
+            except requests.RequestException as exc:
+                last_error = f"Gemini {model}: {exc}"
+                if attempt < 2:
+                    time.sleep(2 ** attempt)
+                    continue
+                break
+            except Exception as exc:
+                last_error = f"Gemini {model}: {exc}"
+                break
+
+    # IMPORTANT: Do not fail the entire Telegram photo analysis if Gemini is down.
+    return {
+        "signal": "WAIT",
+        "confidence": "0",
+        "error": last_error,
+    }
 
 
 # =========================================================
@@ -667,23 +719,18 @@ def calculate_confidence(bot, groq, gemini):
 
 
 # =========================================================
-# FORCE 101+ PIPS ON AI LEVELS
+# VALIDATE AI LEVELS
 # =========================================================
 
-def enforce_minimum_target(data, final, symbol):
-    """
-    Prevent AI from returning a tiny TP.
-    If levels are missing/invalid, return safe WAIT-style levels.
-    """
+def validate_ai_levels(data, final, symbol):
+    """Keep AI levels consistent with the selected direction without forcing a fixed target size."""
     if not isinstance(data, dict):
         return data
 
     try:
-        entry = float(data["entry"])
+        entry = float(data.get("entry"))
     except Exception:
         return data
-
-    distance = min_price_distance(symbol)
 
     try:
         tp = float(data.get("tp", entry))
@@ -695,24 +742,24 @@ def enforce_minimum_target(data, final, symbol):
     except Exception:
         sl = entry
 
-    if final == "BUY":
-        if tp - entry < distance:
-            tp = entry + distance
-        if sl >= entry:
-            sl = entry - distance
+    step = get_pip_size(symbol)
 
+    if final == "BUY":
+        if tp <= entry:
+            tp = entry + step
+        if sl >= entry:
+            sl = entry - step
     elif final == "SELL":
-        if entry - tp < distance:
-            tp = entry - distance
+        if tp >= entry:
+            tp = entry - step
         if sl <= entry:
-            sl = entry + distance
+            sl = entry + step
 
     data["entry"] = entry
     data["tp"] = tp
     data["sl"] = sl
-    data["buy_limit"] = entry - distance
-    data["sell_limit"] = entry + distance
-
+    data["buy_limit"] = entry - step
+    data["sell_limit"] = entry + step
     return data
 
 
@@ -755,7 +802,13 @@ def combined_output(bot, groq, gemini):
         except Exception:
             pass
 
-    source = enforce_minimum_target(source, final, symbol)
+    source = validate_ai_levels(source, final, symbol)
+
+    # Final target-distance safety filter. Do not force a larger TP;
+    # if the selected setup does not support the internal minimum, use WAIT.
+    if final in ["BUY", "SELL"]:
+        if not target_meets_minimum(symbol, source.get("entry"), source.get("tp")):
+            final = "WAIT"
 
     # A final BUY/SELL is only shown when confidence is acceptable.
     if final in ["BUY", "SELL"] and confidence < MIN_CONFIDENCE:
@@ -765,7 +818,7 @@ def combined_output(bot, groq, gemini):
         # Show levels, but clearly mark that there is no accepted trade.
         try:
             entry = float(source.get("entry", bot.get("price")))
-            distance = min_price_distance(symbol)
+            distance = get_pip_size(symbol)
             source["entry"] = entry
             source["tp"] = entry + distance
             source["sl"] = entry - distance
@@ -781,7 +834,6 @@ def combined_output(bot, groq, gemini):
         f"✨ GEMINI: {get_value(gemini, 'signal')}\n\n"
         f"🎯 FINAL: {final}\n"
         f"🔥 Confidence: {confidence}%\n"
-        f"📏 Minimum target: {MIN_PIPS} pips+\n\n"
         f"🟢 Entry: {get_value(source, 'entry')}\n"
         f"🎯 TP: {get_value(source, 'tp')}\n"
         f"🛑 SL: {get_value(source, 'sl')}\n\n"
@@ -810,7 +862,7 @@ def get_value(data, key):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 ETHIO TRADE BOT\n\n"
-        "🎯 Minimum target: 101+ pips\n"
+        "🎯 Live market-structure targets\n"
         "📊 All configured symbols\n"
         "⏱ All configured timeframes\n\n"
         "Use:\n"
@@ -917,7 +969,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             results.append(
                 f"{emoji} {timeframe} | {signal} | "
-                f"{result['confidence']}% | TP≥{MIN_PIPS}p"
+                f"{result['confidence']}% | TP={format_price(result['tp'])}"
             )
 
         except Exception:
@@ -943,7 +995,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text(
         "🔎 Analyzing chart...\n"
         "🤖 BOT + GROQ + GEMINI\n"
-        "🎯 Checking 101+ pips..."
+        "🎯 Checking live market structure..."
     )
 
     try:
@@ -1088,7 +1140,7 @@ def main():
     application.add_error_handler(error_handler)
 
     print("ETHIO TRADE BOT STARTED")
-    print(f"Minimum target: {MIN_PIPS}+ pips")
+    print("Live target mode: market structure + ATR")
     print(f"Symbols: {len(SYMBOLS)}")
     print(f"Timeframes: {len(TIMEFRAMES)}")
 
