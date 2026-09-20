@@ -486,4 +486,4 @@ def analyze_market(df, symbol):
 
     df = calculate_indicators(df)
 
-    if
+    
