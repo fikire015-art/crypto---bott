@@ -98,7 +98,7 @@ PIP_SIZE = {
     "TRX/USD": 0.0001,
 }
 
-MIN_PIPS = 50
+MIN_PIPS = 101
 
 # =========================================================
 # RENDER HEALTH SERVER
