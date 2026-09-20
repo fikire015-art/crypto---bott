@@ -1,401 +1,209 @@
-import os
-import base64
-import asyncio
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-import requests
-import pandas as pd
-
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-
 # =========================================================
-# CONFIG
+# MAIN
 # =========================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+def main():
 
-TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
+    print("================================")
+    print("Starting Crypto Market Bot...")
+    print("================================")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    # -----------------------------------------------------
+    # ENVIRONMENT CHECK
+    # -----------------------------------------------------
 
-PORT = int(os.getenv("PORT", "10000"))
-
-
-# =========================================================
-# SYMBOLS
-# =========================================================
-
-SYMBOLS = [
-    "BTC/USD",
-    "ETH/USD",
-    "BNB/USD",
-    "SOL/USD",
-    "XRP/USD",
-    "DOGE/USD",
-    "ADA/USD",
-    "AVAX/USD",
-    "LINK/USD",
-    "TRX/USD",
-]
-
-
-# =========================================================
-# TIMEFRAMES
-# =========================================================
-
-TIMEFRAMES = [
-    "1min",
-    "5min",
-    "15min",
-    "30min",
-    "45min",
-    "1h",
-    "2h",
-    "4h",
-    "8h",
-    "1day",
-    "1week",
-    "1month",
-]
-
-
-# =========================================================
-# RENDER HEALTH SERVER
-# =========================================================
-
-class HealthHandler(BaseHTTPRequestHandler):
-
-    def do_GET(self):
-
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain"
-        )
-
-        self.end_headers()
-
-        self.wfile.write(
-            b"Crypto Market Bot is running."
-        )
-
-    def log_message(self, format, *args):
-        return
-
-
-def start_health_server():
-
-    server = HTTPServer(
-        ("0.0.0.0", PORT),
-        HealthHandler
+    print(
+        "TELEGRAM_BOT_TOKEN:",
+        "OK" if TELEGRAM_BOT_TOKEN else "MISSING"
     )
 
     print(
-        f"Health server running on port {PORT}"
+        "TWELVE_DATA_KEY:",
+        "OK" if TWELVE_DATA_KEY else "MISSING"
     )
 
-    server.serve_forever()
+    print(
+        "GROQ_API_KEY:",
+        "OK" if GROQ_API_KEY else "MISSING"
+    )
 
+    print(
+        "GEMINI_API_KEY:",
+        "OK" if GEMINI_API_KEY else "MISSING"
+    )
 
-# =========================================================
-# TWELVE DATA
-# =========================================================
+    # -----------------------------------------------------
+    # TELEGRAM TOKEN IS REQUIRED
+    # -----------------------------------------------------
 
-def get_market_data(
-    symbol,
-    interval,
-    outputsize=100
-):
+    if not TELEGRAM_BOT_TOKEN:
 
-    if not TWELVE_DATA_KEY:
-
-        print(
-            "ERROR: TWELVE_DATA_KEY is missing."
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is missing. "
+            "Add it in Render → Environment Variables."
         )
 
-        return None
-
-    url = (
-        "https://api.twelvedata.com/"
-        "time_series"
-    )
-
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVE_DATA_KEY,
-        "format": "JSON",
-    }
+    # -----------------------------------------------------
+    # START RENDER HEALTH SERVER
+    # -----------------------------------------------------
 
     try:
 
-        response = requests.get(
-            url,
-            params=params,
-            timeout=30
+        health_thread = threading.Thread(
+            target=start_health_server,
+            daemon=True
         )
 
-        data = response.json()
+        health_thread.start()
 
-        if "values" not in data:
-
-            print(
-                f"Twelve Data error "
-                f"{symbol} {interval}: "
-                f"{data}"
-            )
-
-            return None
-
-        df = pd.DataFrame(
-            data["values"]
+        print(
+            f"Health server started on port {PORT}"
         )
-
-        numeric_columns = [
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-        ]
-
-        for column in numeric_columns:
-
-            if column in df.columns:
-
-                df[column] = pd.to_numeric(
-                    df[column],
-                    errors="coerce"
-                )
-
-        df = df.sort_values(
-            "datetime"
-        )
-
-        df = df.reset_index(
-            drop=True
-        )
-
-        return df
 
     except Exception as e:
 
         print(
-            f"Market data error "
-            f"{symbol} {interval}: {e}"
+            "Health server error:",
+            e
         )
 
-        return None
+    # -----------------------------------------------------
+    # CREATE TELEGRAM APPLICATION
+    # -----------------------------------------------------
+
+    try:
+
+        application = (
+            Application
+            .builder()
+            .token(
+                TELEGRAM_BOT_TOKEN
+            )
+            .build()
+        )
+
+        print(
+            "Telegram application created."
+        )
+
+    except Exception as e:
+
+        print(
+            "Telegram application creation failed:"
+        )
+
+        print(e)
+
+        raise
+
+    # -----------------------------------------------------
+    # COMMANDS
+    # -----------------------------------------------------
+
+    application.add_handler(
+        CommandHandler(
+            "start",
+            start_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "analyze",
+            analyze_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "scan",
+            scan_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "all",
+            all_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "symbols",
+            symbols_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "timeframes",
+            timeframes_command
+        )
+    )
+
+    # -----------------------------------------------------
+    # PHOTO HANDLER
+    # -----------------------------------------------------
+
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler
+        )
+    )
+
+    # -----------------------------------------------------
+    # ERROR HANDLER
+    # -----------------------------------------------------
+
+    application.add_error_handler(
+        error_handler
+    )
+
+    print("================================")
+    print("Telegram bot is starting...")
+    print("================================")
+
+    # -----------------------------------------------------
+    # START POLLING
+    # -----------------------------------------------------
+
+    try:
+
+        application.run_polling(
+            drop_pending_updates=True
+        )
+
+    except Exception as e:
+
+        print("================================")
+        print("TELEGRAM BOT CRASHED")
+        print("================================")
+
+        print(
+            f"Error: {e}"
+        )
+
+        raise
 
 
 # =========================================================
-# TECHNICAL INDICATORS
+# ENTRY POINT
 # =========================================================
 
-def calculate_indicators(df):
+if __name__ == "__main__":
 
-    df = df.copy()
+    try:
 
-    # EMA 9
-    df["EMA9"] = (
-        df["close"]
-        .ewm(
-            span=9,
-            adjust=False
-        )
-        .mean()
-    )
+        main()
 
-    # EMA 21
-    df["EMA21"] = (
-        df["close"]
-        .ewm(
-            span=21,
-            adjust=False
-        )
-        .mean()
-    )
+    except Exception as e:
 
-    # RSI
-    delta = df["close"].diff()
+        print("================================")
+        print("FATAL ERROR")
+        print("================================")
 
-    gain = delta.clip(
-        lower=0
-    )
+        print(e)
 
-    loss = -delta.clip(
-        upper=0
-    )
-
-    avg_gain = (
-        gain
-        .rolling(14)
-        .mean()
-    )
-
-    avg_loss = (
-        loss
-        .rolling(14)
-        .mean()
-    )
-
-    rs = (
-        avg_gain /
-        avg_loss.replace(
-            0,
-            pd.NA
-        )
-    )
-
-    df["RSI14"] = (
-        100 -
-        (
-            100 /
-            (1 + rs)
-        )
-    )
-
-    # Support / resistance
-    df["HIGH20"] = (
-        df["high"]
-        .rolling(20)
-        .max()
-    )
-
-    df["LOW20"] = (
-        df["low"]
-        .rolling(20)
-        .min()
-    )
-
-    return df
-
-
-# =========================================================
-# MARKET ANALYSIS
-# =========================================================
-
-def analyze_market(
-    df,
-    symbol,
-    timeframe
-):
-
-    if df is None:
-
-        return {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "signal": "NO DATA",
-            "confidence": 0,
-            "price": 0,
-            "rsi": 0,
-            "ema9": 0,
-            "ema21": 0,
-            "support": 0,
-            "resistance": 0,
-        }
-
-    if len(df) < 30:
-
-        return {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "signal": "NO DATA",
-            "confidence": 0,
-            "price": 0,
-            "rsi": 0,
-            "ema9": 0,
-            "ema21": 0,
-            "support": 0,
-            "resistance": 0,
-        }
-
-    df = calculate_indicators(df)
-
-    last = df.iloc[-1]
-
-    price = float(
-        last["close"]
-    )
-
-    ema9 = float(
-        last["EMA9"]
-    )
-
-    ema21 = float(
-        last["EMA21"]
-    )
-
-    rsi_value = last["RSI14"]
-
-    if pd.isna(rsi_value):
-
-        rsi = 50.0
-
-    else:
-
-        rsi = float(rsi_value)
-
-    support_value = last["LOW20"]
-
-    resistance_value = last["HIGH20"]
-
-    if pd.isna(support_value):
-
-        support = 0
-
-    else:
-
-        support = float(
-            support_value
-        )
-
-    if pd.isna(resistance_value):
-
-        resistance = 0
-
-    else:
-
-        resistance = float(
-            resistance_value
-        )
-
-    score = 0
-
-    # -----------------------------------------------------
-    # EMA TREND
-    # -----------------------------------------------------
-
-    if ema9 > ema21:
-
-        score += 1
-
-    elif ema9 < ema21:
-
-        score -= 1
-
-    # -----------------------------------------------------
-    # RSI
-    # -----------------------------------------------------
-
-    if rsi >= 55:
-
-        score += 1
-
-    elif rsi <= 45:
-
-        score
+        raise
