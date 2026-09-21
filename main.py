@@ -36,8 +36,6 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_FALLBACK_MODELS = [
     GEMINI_MODEL,
     "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
 ]
 
 # Minimum confidence for a technical BUY/SELL signal.
@@ -538,7 +536,7 @@ def groq_photo_analysis(image_path):
         url,
         headers=headers,
         json=payload,
-        timeout=120,
+        timeout=25,
     )
     response.raise_for_status()
 
@@ -596,12 +594,12 @@ def gemini_photo_analysis(image_path):
             f"?key={GEMINI_API_KEY}"
         )
 
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 response = requests.post(
                     url,
                     json=payload,
-                    timeout=120,
+                    timeout=25,
                 )
 
                 # Retry transient server/rate-limit errors.
@@ -609,8 +607,8 @@ def gemini_photo_analysis(image_path):
                     last_error = (
                         f"Gemini {model}: HTTP {response.status_code}"
                     )
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
+                    if attempt < 1:
+                        time.sleep(1)
                         continue
                     break
 
@@ -645,8 +643,8 @@ def gemini_photo_analysis(image_path):
 
             except requests.RequestException as exc:
                 last_error = f"Gemini {model}: {exc}"
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
+                if attempt < 1:
+                    time.sleep(1)
                     continue
                 break
             except Exception as exc:
