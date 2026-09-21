@@ -33,10 +33,7 @@ PORT = int(os.getenv("PORT", "10000"))
 
 GROQ_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-GEMINI_FALLBACK_MODELS = [
-    GEMINI_MODEL,
-    "gemini-3.7-flash",
-]
+GEMINI_FALLBACK_MODELS = [GEMINI_MODEL]
 
 # Minimum confidence for a technical BUY/SELL signal.
 MIN_CONFIDENCE = 80
@@ -220,7 +217,7 @@ def get_market_data(symbol, interval="30min", outputsize=150):
         "format": "JSON",
     }
 
-    response = requests.get(url, params=params, timeout=30)
+    response = requests.get(url, params=params, timeout=8)
     response.raise_for_status()
 
     data = response.json()
@@ -536,7 +533,7 @@ def groq_photo_analysis(image_path):
         url,
         headers=headers,
         json=payload,
-        timeout=25,
+        timeout=8,
     )
     response.raise_for_status()
 
@@ -594,12 +591,12 @@ def gemini_photo_analysis(image_path):
             f"?key={GEMINI_API_KEY}"
         )
 
-        for attempt in range(2):
+        for attempt in range(1):
             try:
                 response = requests.post(
                     url,
                     json=payload,
-                    timeout=25,
+                    timeout=8,
                 )
 
                 # Retry transient server/rate-limit errors.
@@ -607,9 +604,6 @@ def gemini_photo_analysis(image_path):
                     last_error = (
                         f"Gemini {model}: HTTP {response.status_code}"
                     )
-                    if attempt < 1:
-                        time.sleep(1)
-                        continue
                     break
 
                 response.raise_for_status()
@@ -643,9 +637,6 @@ def gemini_photo_analysis(image_path):
 
             except requests.RequestException as exc:
                 last_error = f"Gemini {model}: {exc}"
-                if attempt < 1:
-                    time.sleep(1)
-                    continue
                 break
             except Exception as exc:
                 last_error = f"Gemini {model}: {exc}"
@@ -992,21 +983,19 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text(
         "🔎 Analyzing chart...\n"
-        "🤖 BOT + GROQ + GEMINI\n"
+        "🤖 BOT + GROQ (FAST MODE)\n"
         "🎯 Checking live market structure..."
     )
 
     try:
-        groq_task = asyncio.to_thread(
-            groq_photo_analysis, image_path
-        )
-        gemini_task = asyncio.to_thread(
-            gemini_photo_analysis, image_path
-        )
-
-        groq, gemini = await asyncio.gather(
-            groq_task, gemini_task
-        )
+        # Fast photo mode: Groq is the primary image analyzer.
+        # Gemini is kept as an optional backup, but it must not delay the user.
+        groq = await asyncio.to_thread(groq_photo_analysis, image_path)
+        gemini = {
+            "signal": "WAIT",
+            "confidence": "0",
+            "error": "Gemini skipped in fast photo mode",
+        }
 
         bot = None
         detected_symbol = None
